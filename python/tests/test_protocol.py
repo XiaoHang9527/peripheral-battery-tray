@@ -230,6 +230,60 @@ def test_hidpp_feature_retries_timeout_and_caches_valid_reply(monkeypatch, featu
     assert len(calls) == 2
 
 
+def test_hidpp_request_rejects_late_reply_with_previous_id(monkeypatch):
+    previous = None
+
+    class Link:
+        def exchange(self, packet, match, timeout):
+            nonlocal previous
+            assert packet[3] & 0x0F
+            assert match(packet) and not match(packet[:7])
+            if previous is not None:
+                assert not match(previous)
+            previous = packet
+            return packet, None
+
+    monkeypatch.setattr(kb, "get_link", lambda path, length: Link())
+    for _ in range(17):
+        assert kb.hidpp_request("receiver", 1, 5, 0)
+
+
+@pytest.mark.parametrize("previous,replies,expected,confirmed", [
+    (90, [4, 90], 90, True),
+    (90, [4, None], 90, False),
+    (90, [4, 50], 90, False),
+    (90, [4, 4], 4, True),
+    (90, [89], 89, True),
+    (5, [4], 4, True),
+    (None, [4, 90], None, False),
+])
+def test_logitech_poll_confirms_large_changes_before_publishing(monkeypatch, previous, replies, expected, confirmed):
+    device = kb.Device("mouse", "键盘", "receiver", 1)
+    device.present = True
+    device.name = "Test"
+    device.level = previous
+    old_time = 1 if previous is not None else None
+    device.updated = old_time
+    readings = iter(replies)
+
+    def battery(path, slot):
+        level = next(readings)
+        return ((level, 0), None) if level is not None else (None, "电量查询无应答")
+
+    monkeypatch.setattr(kb, "hidpp_battery", battery)
+    monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(kb, "log", lambda text: None)
+    delay = kb.poll_device(device, [])
+    assert next(readings, "exhausted") == "exhausted"
+    assert device.level == expected
+    if confirmed:
+        assert device.updated != old_time and not device.error
+        assert delay == kb.CFG["interval_sec"]
+    else:
+        assert device.updated == old_time and device.error == kb.HIDPP_UNCONFIRMED
+        assert delay == 3
+
+
 def test_compx_prefers_original_receiver_and_accepts_matching_vendor_interface():
     extra = dict(vid=0x3554, pid=0xFB40, page=0xFF04, usage=2,
                  inl=20, outl=20, inst="extra")
@@ -291,7 +345,7 @@ def test_logitech_polls_each_slot_and_discovers_devices_after_wakeup(monkeypatch
     monkeypatch.setattr(kb, "KB", keyboard)
     monkeypatch.setattr(kb, "DEVICES", [keyboard])
     monkeypatch.setattr(kb, "_HIDPP_CACHE", {})
-    monkeypatch.setattr(kb, "_LOGITECH_SCAN_DUE", 0.0)
+    monkeypatch.setattr(kb, "_RECEIVER_ACTIVITY", {})
     monkeypatch.setattr(kb, "enum_hid", lambda: receivers)
     monkeypatch.setattr(kb.time, "sleep", lambda seconds: None)
     monkeypatch.setattr(kb, "save_config", lambda: None)

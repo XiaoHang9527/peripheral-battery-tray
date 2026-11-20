@@ -1,6 +1,7 @@
 #include "devices.hpp"
 
 #include <windows.h>
+#include <devpropdef.h>
 #include <setupapi.h>
 #include <hidsdi.h>
 
@@ -17,6 +18,7 @@ namespace {
 
 using namespace std::chrono_literals;
 using Bytes = std::vector<std::uint8_t>;
+constexpr DEVPROPKEY containerIdKey{{0x8c7ed206, 0x3f8a, 0x4827, {0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c}}, 2};
 
 struct HidLog {
     std::mutex lock;
@@ -119,24 +121,44 @@ Bytes receive(const HidInterface& device, HANDLE reader, Match match, Clock::tim
 
 class Link {
 public:
-    Link(const HidInterface& device, const std::atomic_bool& stop)
+    Link(const HidInterface& device, const std::atomic_bool& stop, const HidInterface* output = nullptr)
         : reader_(openHid(device.path, GENERIC_READ, true)),
-          writer_(openHid(device.path, GENERIC_WRITE, true)),
-          device_(device), stop_(stop) {}
+          writer_(openHid((output ? *output : device).path, GENERIC_WRITE, true)),
+          device_(device), output_(output ? *output : device), stop_(stop) {}
 
     template<typename Match>
     Bytes exchange(Bytes request, Match match, std::chrono::milliseconds timeout) const {
         if (!reader_ || !writer_ || stop_) return {};
         HidD_FlushQueue(reader_.value);
         const auto deadline = Clock::now() + timeout;
-        if (transfer(device_, writer_.value, request, true, deadline, stop_) != request.size()) return {};
+        if (transfer(output_, writer_.value, request, true, deadline, stop_) != request.size()) return {};
         return receive(device_, reader_.value, match, deadline, stop_);
     }
 private:
     Handle reader_, writer_;
-    const HidInterface& device_;
+    const HidInterface& device_, &output_;
     const std::atomic_bool& stop_;
 };
+
+bool sameContainer(const HidInterface& a, const HidInterface& b) {
+    constexpr std::array<std::uint8_t, 16> noContainer{};
+    constexpr std::array<std::uint8_t, 16> systemContainer{0, 0, 0, 0, 0, 0, 0, 0,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    return a.vid == b.vid && a.pid == b.pid && a.container == b.container
+        && a.container != noContainer && a.container != systemContainer;
+}
+
+std::optional<ReceiverActivity::Counters> readUnifyingActivity(const HidInterface& longHid,
+        const HidInterface& shortHid, const std::atomic_bool& stop) {
+    // HID++ 1.0 register B3 at address FF is local to the USB receiver.
+    const auto report = Link(longHid, stop, &shortHid).exchange({0x10, 0xff, 0x83, 0xb3, 0, 0, 0}, [](Report r) {
+        return r.size() == 20 && r[0] == 0x11 && r[1] == 0xff && r[2] == 0x83 && r[3] == 0xb3;
+    }, 180ms);
+    if (report.empty()) return std::nullopt;
+    ReceiverActivity::Counters result{};
+    std::copy_n(report.begin() + 4, result.size(), result.begin());
+    return result;
+}
 
 bool waitForDevice(std::chrono::milliseconds delay, const std::atomic_bool& stop) {
     const auto deadline = Clock::now() + delay;
@@ -166,15 +188,18 @@ Bytes askCompx(const Link& link, unsigned command, const std::atomic_bool& stop)
 
 Bytes askHidpp(const Link& link, unsigned slot, unsigned feature, unsigned function,
                std::initializer_list<unsigned> parameters = {}, std::chrono::milliseconds timeout = 320ms) {
+    // The scanner serializes requests. Rotate the echoed ID to skip late replies to earlier calls.
+    static unsigned softwareId = 0;
+    softwareId = softwareId % 15 + 1;
     Bytes packet(hidppLength);
     packet[0] = 0x11;
     packet[1] = static_cast<std::uint8_t>(slot);
     packet[2] = static_cast<std::uint8_t>(feature);
-    const auto command = static_cast<std::uint8_t>((function << 4) | 1);
+    const auto command = static_cast<std::uint8_t>((function << 4) | softwareId);
     packet[3] = command;
     std::copy(parameters.begin(), parameters.end(), packet.begin() + 4);
     return link.exchange(std::move(packet), [=](Report r) {
-        return r.size() >= 7 && r[0] == 0x11 && r[1] == slot && r[2] == feature && r[3] == command;
+        return hidppReply(r, slot, feature, command);
     }, timeout);
 }
 
@@ -407,9 +432,14 @@ std::vector<HidInterface> enumerateHid() {
         const auto status = HidP_GetCaps(preparsed, &caps);
         HidD_FreePreparsedData(preparsed);
         if (status != HIDP_STATUS_SUCCESS) continue;
-        wchar_t product[128]{};
-        HidD_GetProductString(hid.value, product, sizeof(product));
-        devices.push_back({detail->DevicePath, instance, product, attributes.VendorID, attributes.ProductID,
+        std::array<std::uint8_t, 16> container{};
+        DEVPROPTYPE type{};
+        DWORD written{};
+        if (!SetupDiGetDevicePropertyW(info, &data, &containerIdKey, &type, container.data(), container.size(), &written, 0)
+            || type != DEVPROP_TYPE_GUID || written != container.size()) container = {};
+        std::wstring path(detail->DevicePath);
+        CharUpperBuffW(path.data(), static_cast<DWORD>(path.size()));
+        devices.push_back({std::move(path), instance, container, attributes.VendorID, attributes.ProductID,
                            caps.UsagePage, caps.Usage, caps.InputReportByteLength,
                            caps.OutputReportByteLength, caps.FeatureReportByteLength});
     }
@@ -423,45 +453,72 @@ std::vector<std::wstring> takeHidDiagnostics() {
 }
 
 std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, int retention, bool refresh,
-                                    bool retryLogitech) {
+                                    bool rescan, const InputActivities& activity, bool (*allowAutomatic)()) {
     using Protocol = Candidate::Protocol;
-    const auto interfaces = enumerateHid();
+    const auto started = Clock::now();
+    if (refresh || rescan || started >= inventoryDue_) {
+        interfaces_ = enumerateHid();
+        inventoryDue_ = Clock::now() + 30s;
+    }
+    if (rescan) receiverActivity_.clear();
+    const auto inputFor = [&](const HidInterface& target) {
+        InputActivity latest;
+        for (const auto& source : interfaces_) {
+            if (source.page != 1 || (source.usage != 2 && source.usage != 6)) continue;
+            const auto it = activity.find(source.path);
+            if (it != activity.end() && it->second.last > latest.last && sameContainer(source, target)) latest = it->second;
+        }
+        return latest;
+    };
     const HidInterface* compx = nullptr;
     std::map<std::wstring, std::vector<Candidate>> vendorCollections;
     std::vector<Candidate> candidates;
     std::set<std::wstring> receivers;
-    for (const auto& hid : interfaces) {
+    for (const auto& hid : interfaces_) {
         if (stop) return {};
         if (hid.vid == 0x3554 && (hid.pid == 0xfa09 || hid.pid == 0xfb40) && hid.usage == 2
             && hid.input == 20 && hid.output == 20 && (hid.page == 0xff02 || hid.page == 0xff04)) {
             if (!compx || (hid.pid == 0xfa09 && hid.page == 0xff02)) compx = &hid;
         } else if (hid.vid == 0x046d && hid.page == 0xff00 && hid.input == 20 && hid.output == 20) {
             if (!receivers.insert(hid.instance).second) continue;
-            const bool probe = refresh || Clock::now() >= receiverScans_[hid.instance];
-            const Link discovery(hid, stop);
-            const auto scanSlots = [&](std::chrono::milliseconds timeout) {
+            const bool unifying = hid.usage == 2 && (hid.pid == 0xc52b || hid.pid == 0xc532);
+            auto& receiver = receiverActivity_[hid.instance];
+            if (!refresh && unifying && Clock::now() >= receiver.due) {
+                const auto shortHid = std::find_if(interfaces_.begin(), interfaces_.end(), [&](const auto& peer) {
+                    return peer.page == 0xff00 && peer.usage == 1 && peer.input == 7 && peer.output == 7
+                        && sameContainer(peer, hid) && physicalCollection(peer.instance) == physicalCollection(hid.instance);
+                });
+                const auto counters = shortHid != interfaces_.end() ? readUnifyingActivity(hid, *shortHid, stop) : std::nullopt;
+                receiver.observe(counters, Clock::now());
+            }
+            const auto collectSlots = [&](auto timeout) {
+                std::optional<Link> discovery;
                 for (unsigned slot = 1; slot <= 6 && !stop; ++slot) {
                     const auto key = hid.instance + L":" + std::to_wstring(slot);
                     if (!entries_.contains(key)) {
-                        if (!probe) continue;
-                        const auto response = askHidpp(discovery, slot, 0, 1, {}, timeout);
+                        auto& probe = receiver.discovery[slot - 1];
+                        const auto now = Clock::now();
+                        if (!refresh && (!unifying || !probe.ready(receiver.slots[slot - 1], now)
+                            || !allowAutomatic || !allowAutomatic())) continue;
+                        if (!discovery) discovery.emplace(hid, stop);
+                        probe = {now + 15s, now};
+                        const auto response = askHidpp(*discovery, slot, 0, 1, {}, timeout);
+                        if (unifying) receiver.queriedDevice(slot, Clock::now());
                         if (response.empty() || (response[4] != 2 && response[4] != 4)) continue;
                     }
                     candidates.push_back({hid, Protocol::logitech, L"Logitech 设备 " + std::to_wstring(slot), slot});
                 }
             };
             const auto begin = candidates.size();
-            scanSlots(200ms);
-            // A receiver may need one extra pass before a paired device answers.
-            if (probe && candidates.size() == begin && !stop) scanSlots(350ms);
-            if (probe) receiverScans_[hid.instance] = Clock::now() + 60s;
+            collectSlots(200ms);
+            if (refresh && candidates.size() == begin && !stop) collectSlots(350ms);
         } else if (const auto* name = matchRapoo(hid)) {
             candidates.push_back({hid, Protocol::rapoo, name});
         } else if (const auto* model = matchVendor(hid)) {
             vendorCollections[physicalCollection(hid.instance)].push_back({hid, Protocol::vendor, model->name, 0, model});
         }
     }
-    std::erase_if(receiverScans_, [&](const auto& item) { return !receivers.contains(item.first); });
+    std::erase_if(receiverActivity_, [&](const auto& item) { return !receivers.contains(item.first); });
     if (compx) candidates.push_back({*compx, Protocol::compx, L"2.4G 键盘"});
     for (const auto& [key, matches] : vendorCollections) {
         if (matches.size() == 1) candidates.push_back(matches.front());
@@ -480,11 +537,10 @@ std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, 
         if (device.key.empty()) {
             device.key = key;
             device.name = candidate.name;
-            device.logitech = logitech;
         }
         if (!device.present) {
             device.disconnected = {};
-            state.due = {};
+            state.schedule = {};
             state.named = state.kindKnown = false;
         }
         if (!device.present || refresh) {
@@ -494,9 +550,14 @@ std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, 
             if (logitech) state.named = state.kindKnown = false;
         }
         device.present = true;
-        if (!refresh && Clock::now() < state.due && !(retryLogitech && device.awaitingLogitechReply())) continue;
+        if (!refresh) {
+            const auto latest = logitech ? receiverActivity_.at(hid.instance).slots[candidate.slot - 1] : inputFor(hid);
+            if (!state.schedule.ready(latest, Clock::now()) || !allowAutomatic || !allowAutomatic()) continue;
+        }
+        state.schedule.attempted = Clock::now();
 
         std::optional<Reading> reading;
+        device.readingUnconfirmed = false;
         switch (candidate.protocol) {
         case Protocol::compx: {
             const Link link(hid, stop);
@@ -504,11 +565,13 @@ std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, 
                 const auto reply = askCompx(link, compxModelCommand, stop);
                 if (!reply.empty()) {
                     if (const auto* model = compxModelName(reply[10])) device.name = model;
-                    else if (!hid.product.empty()) device.name = hid.product;
                     else {
-                        wchar_t model[16]{};
-                        swprintf(model, std::size(model), L"型号 0x%02X", static_cast<unsigned>(reply[10]));
-                        device.name = model;
+                        const Handle handle(openHid(hid.path, 0));
+                        wchar_t product[128]{};
+                        wchar_t modelLabel[16]{};
+                        swprintf(modelLabel, std::size(modelLabel), L"型号 0x%02X", static_cast<unsigned>(reply[10]));
+                        device.name = handle && HidD_GetProductString(handle.value, product, sizeof(product)) && *product
+                            ? product : modelLabel;
                     }
                     state.named = true;
                 }
@@ -538,8 +601,17 @@ std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, 
                 }
             }
             reading = readHidpp(link, candidate.slot, state.features, state.percentage);
-            if (reading && device.updated.time_since_epoch().count() == 0 && waitForDevice(150ms, stop)) {
-                if (const auto confirmed = readHidpp(link, candidate.slot, state.features, state.percentage)) reading = confirmed;
+            if (reading && reading->level && needsHidppConfirmation(*reading->level, device.reading.level)) {
+                const int first = *reading->level;
+                if (!waitForDevice(150ms, stop)) return {};
+                const auto second = readHidpp(link, candidate.slot, state.features, state.percentage);
+                reading = confirmHidppReading(first, second, device.reading.level);
+                device.readingUnconfirmed = !reading;
+                if (!reading || std::abs(first - *reading->level) > 5) {
+                    const auto repeated = second && second->level ? std::to_wstring(*second->level) + L"%" : L"无读数";
+                    noteHid(device.name + L" 电量复读 " + std::to_wstring(first) + L"% → " + repeated
+                        + (reading ? L"，采用复读值" : L"，本轮未确认"));
+                }
             }
             break;
         }
@@ -573,13 +645,19 @@ std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, 
         constexpr int backoff[] = {0, 60, 120, 180, 300};
         constexpr int logitechBackoff[] = {0, 15, 30, 60, 60};
         const int delay = state.failures ? (logitech ? logitechBackoff : backoff)[state.failures] : interval;
-        state.due = Clock::now() + std::chrono::seconds(delay);
+        state.schedule.due = Clock::now() + std::chrono::seconds(device.readingUnconfirmed && state.failures == 1 ? 3 : delay);
+        if (logitech && hid.usage == 2 && (hid.pid == 0xc52b || hid.pid == 0xc532)) {
+            receiverActivity_.at(hid.instance).queriedDevice(candidate.slot, Clock::now());
+        }
     }
 
-    const auto headsets = connectedHeadsets(stop);
+    if (refresh || rescan || Clock::now() >= bluetoothDue_) {
+        headsets_ = connectedHeadsets(stop);
+        bluetoothDue_ = Clock::now() + std::chrono::seconds(std::min(interval, 30));
+    }
     if (stop) return {};
     const auto now = Clock::now();
-    for (const auto& headset : headsets) {
+    for (const auto& headset : headsets_) {
         const auto key = L"bluetooth:" + std::to_wstring(headset.address);
         if (!found.insert(key).second) continue;
         auto& state = entries_[key];
@@ -589,11 +667,10 @@ std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, 
         device.name = headset.name;
         device.bluetooth = device.present = true;
         device.disconnected = {};
-        if (!refresh && !reconnected && now < state.due && device.fresh == headset.level.has_value()
+        if (!reconnected && device.fresh == headset.level.has_value()
             && (!headset.level || headset.level == device.reading.level)) continue;
         if (headset.level) device.acceptReading(Reading{headset.level}, std::chrono::system_clock::now());
         else device.fresh = false;
-        state.due = now + std::chrono::seconds(interval);
     }
 
     std::vector<Device> result;
@@ -614,12 +691,13 @@ std::vector<Device> Scanner::sample(const std::atomic_bool& stop, int interval, 
 }
 
 Clock::time_point Scanner::nextWake(int retention) const {
-    auto wake = Clock::now() + std::chrono::seconds(30);
-    for (const auto& [key, entry] : entries_) {
-        wake = std::min(wake, entry.device.present ? entry.due
-            : entry.device.disconnected + std::chrono::minutes(retention));
+    auto wake = std::min(inventoryDue_, bluetoothDue_);
+    for (const auto& [key, receiver] : receiverActivity_) {
+        if (receiver.due != Clock::time_point{}) wake = std::min(wake, receiver.due);
     }
-    for (const auto& [key, due] : receiverScans_) wake = std::min(wake, due);
+    for (const auto& [key, entry] : entries_) {
+        if (!entry.device.present) wake = std::min(wake, entry.device.disconnected + std::chrono::minutes(retention));
+    }
     return wake;
 }
 

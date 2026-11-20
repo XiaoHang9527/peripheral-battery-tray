@@ -11,6 +11,7 @@ import ctypes.wintypes as wt
 import collections
 import hashlib
 from importlib.metadata import PackageNotFoundError, version as package_version
+from itertools import cycle
 import json
 import logging
 import os
@@ -102,7 +103,7 @@ LOG = os.path.join(LOCALDIR, "tray.log")
 LAST = os.path.join(LOCALDIR, "last.json")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-from hid_transport import GUID, close_all, enum_hid, get_link, hid_path, k32, read_input_report
+from hid_transport import GUID, HidLink, close_all, enum_hid, get_link, hid_path, k32, read_input_report
 
 u32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -421,6 +422,11 @@ u32.GetForegroundWindow.restype = wt.HWND
 u32.GetSystemMetrics.restype = ctypes.c_int
 u32.GetSystemMetrics.argtypes = [ctypes.c_int]
 u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+u32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+u32.WindowFromPoint.argtypes = [wt.POINT]
+u32.WindowFromPoint.restype = wt.HWND
+u32.GetAncestor.argtypes = [wt.HWND, wt.UINT]
+u32.GetAncestor.restype = wt.HWND
 u32.GetWindowLongW.restype = ctypes.c_long
 u32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
 u32.SetWindowPos.argtypes = [wt.HWND, wt.HWND, ctypes.c_int, ctypes.c_int,
@@ -482,6 +488,9 @@ def tray_icon_rect():
 
 # ---- 热插拔（WM_DEVICECHANGE）与系统设置变化
 WM_DEVICECHANGE = 0x0219
+WM_POWERBROADCAST = 0x0218
+WM_INPUT_DEVICE_CHANGE = 0x00FE
+WM_INPUT = 0x00FF
 WM_DESTROY = 0x0002
 WM_SETTINGCHANGE = 0x001A      # 主题/个性化变化时系统广播
 WM_THEMECHANGED = 0x031A
@@ -495,6 +504,12 @@ WM_APP_STOP = 0x8000 + 1
 WM_APP_OPEN = 0x8000 + 2
 DBT_DEVTYP_DEVICEINTERFACE = 0x0005
 DEVICE_NOTIFY_ALL_INTERFACE_CLASSES = 0x4
+POLL_IDLE_MS = 15_000
+POLL_INPUT_SETTLE_MS = 400
+ACTIVITY_TIMEOUT = 5.0
+ACTIVITY_RESUME_GAP = 15.0
+PASSIVE_TRAY_WINDOWS = {"Shell_TrayWnd", "Shell_SecondaryTrayWnd", "NotifyIconOverflowWindow",
+                        "TopLevelWindowForOverflowXamlIsland"}
 
 WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_void_p, wt.HWND, wt.UINT, wt.WPARAM,
                              wt.LPARAM)
@@ -512,6 +527,20 @@ class DEV_BROADCAST_DEVICEINTERFACE(ctypes.Structure):
     _fields_ = [("dbcc_size", wt.DWORD), ("dbcc_devicetype", wt.DWORD),
                 ("dbcc_reserved", wt.DWORD), ("dbcc_classguid", GUID),
                 ("dbcc_name", wt.WCHAR * 1)]
+
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("dwTime", wt.DWORD)]
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = [("usUsagePage", wt.USHORT), ("usUsage", wt.USHORT),
+                ("dwFlags", wt.DWORD), ("hwndTarget", wt.HWND)]
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = [("dwType", wt.DWORD), ("dwSize", wt.DWORD),
+                ("hDevice", wt.HANDLE), ("wParam", wt.WPARAM)]
 
 
 k32.GetModuleHandleW.restype = wt.HMODULE
@@ -532,6 +561,17 @@ u32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
 u32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
 u32.PostMessageW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
 u32.PostQuitMessage.argtypes = [ctypes.c_int]
+u32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+u32.GetLastInputInfo.restype = wt.BOOL
+u32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RAWINPUTDEVICE), wt.UINT, wt.UINT]
+u32.GetRawInputData.argtypes = [
+    wt.HANDLE, wt.UINT, ctypes.c_void_p, ctypes.POINTER(wt.UINT), wt.UINT]
+u32.GetRawInputData.restype = wt.UINT
+u32.GetRawInputDeviceInfoW.argtypes = [
+    wt.HANDLE, wt.UINT, ctypes.c_void_p, ctypes.POINTER(wt.UINT)]
+u32.GetRawInputDeviceInfoW.restype = wt.UINT
+k32.GetTickCount.argtypes = []
+k32.GetTickCount.restype = wt.DWORD
 
 
 WS_CAPTION = 0x00C00000
@@ -595,8 +635,9 @@ def compx_model(inst):
 # ---------------------------------------------------------------- Logitech HID++
 
 _HIDPP_CACHE = {}
-_LOGITECH_SCAN_DUE = 0.0
-LOGITECH_SCAN_INTERVAL = 60
+_HIDPP_SOFTWARE_IDS = cycle(range(1, 16))
+HIDPP_UNCONFIRMED = "电量待确认"
+_RECEIVER_ACTIVITY = {}
 HIDPP_TYPES = {0: "键盘", 1: "遥控器", 2: "数字键盘", 3: "鼠标",
                4: "触控板", 5: "轨迹球", 6: "演示器"}
 
@@ -610,15 +651,16 @@ def _set_error(dev, msg):
 
 
 
-def hidpp_request(path, dev, feat, fn, params=b"", swid=1, timeout=0.35):
-    # 用非零软件 ID 区分查询应答和设备主动上报。
+def hidpp_request(path, dev, feat, fn, params=b"", timeout=0.35):
+    # 轮换非零软件 ID，区分本次查询、迟到应答和设备主动上报。
+    command = (fn << 4) | next(_HIDPP_SOFTWARE_IDS)
     p = bytearray(20)
-    p[0], p[1], p[2], p[3] = 0x11, dev, feat, (fn << 4) | swid
+    p[0], p[1], p[2], p[3] = 0x11, dev, feat, command
     p[4:4 + len(params)] = params
+    header = p[:4]
 
     def match(f):
-        return (len(f) >= 7 and f[0] == 0x11 and f[1] == dev and f[2] == feat
-                and (f[3] >> 4) == fn and (f[3] & 0x0F) == swid)
+        return len(f) == 20 and f[:4] == header
 
     r, _ = get_link(path, 20).exchange(bytes(p), match, timeout)
     return r
@@ -710,6 +752,7 @@ class Device:
         self.present = False
         self.disconnected_at = None
         self.next_due = 0.0        # 下次轮询时间戳
+        self.last_attempt = 0.0   # 单调时钟，与外设活动时间比较
         self.fails = 0             # 连续失败次数（用于退避）
         self.clear_reading()
 
@@ -733,6 +776,7 @@ class Device:
     def set_present(self, present):
         if present and not self.present:
             self.next_due = 0.0
+            self.last_attempt = 0.0
             self.fails = 0
         if present:
             self.disconnected_at = None
@@ -1472,6 +1516,7 @@ class HotplugWatcher:
         self._state_lock = threading.Lock()
         self._device_changed = False
         self._refresh_phase = ""
+        self._inputs = {}
         self._refresh_failed_at = 0.0
         self._settings = threading.Event()
         self._hwnd = None
@@ -1500,6 +1545,11 @@ class HotplugWatcher:
                 log(f"热插拔通知注册失败，使用定时扫描 err={ctypes.get_last_error()}")
             else:
                 log("热插拔监听就绪 hwnd=%#x" % hwnd)
+            # INPUTSINK | DEVNOTIFY, with ordinary keyboard and mouse input left enabled.
+            inputs = (RAWINPUTDEVICE * 2)(RAWINPUTDEVICE(1, 2, 0x2100, hwnd),
+                                         RAWINPUTDEVICE(1, 6, 0x2100, hwnd))
+            if not u32.RegisterRawInputDevices(inputs, len(inputs), ctypes.sizeof(RAWINPUTDEVICE)):
+                log("无法监听外设活动，可使用手动刷新")
             self._ready.set()
             msg = wt.MSG()
             while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -1513,6 +1563,19 @@ class HotplugWatcher:
             with self._state_lock:
                 self._device_changed = True
                 self._event.set()
+        elif msg == WM_POWERBROADCAST and wparam in (0x07, 0x12):  # Resume suspend / automatic.
+            with self._state_lock:
+                self._inputs.clear()
+                self._device_changed = True
+                self._event.set()
+            return 1
+        elif msg == WM_INPUT:
+            self._record_input(lparam)
+        elif msg == WM_INPUT_DEVICE_CHANGE:
+            if wparam == 2:                   # GIDC_REMOVAL
+                with self._state_lock:
+                    self._inputs.pop(lparam, None)
+            return 0
         elif msg in (WM_SETTINGCHANGE, WM_THEMECHANGED, WM_DISPLAYCHANGE):
             self._settings.set()               # 主题/分辨率变了，让 ui_tick 复核
         elif msg == WM_APP_STOP:
@@ -1527,6 +1590,35 @@ class HotplugWatcher:
             u32.PostQuitMessage(0)
             return 0
         return u32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    def _record_input(self, raw_handle):
+        # Read just the header. Key codes and mouse actions are not collected.
+        header = RAWINPUTHEADER()
+        size = wt.UINT(ctypes.sizeof(header))
+        if (u32.GetRawInputData(raw_handle, 0x10000005, ctypes.byref(header), ctypes.byref(size),
+                                ctypes.sizeof(header)) != ctypes.sizeof(header)
+                or not header.hDevice or header.dwType not in (0, 1)):
+            return
+        with self._state_lock:
+            cached = self._inputs.get(header.hDevice)
+            if cached is None:
+                length = wt.UINT()
+                u32.GetRawInputDeviceInfoW(header.hDevice, 0x20000007, None, ctypes.byref(length))
+                name = ctypes.create_unicode_buffer(length.value)
+                if (not length.value or u32.GetRawInputDeviceInfoW(
+                        header.hDevice, 0x20000007, name, ctypes.byref(length)) == 0xFFFFFFFF):
+                    return
+                path, last, resumed = name.value.lower(), 0.0, 0.0
+            else:
+                path, last, resumed = cached
+            now = time.monotonic()
+            self._inputs[header.hDevice] = (path, now, now if not last or now - last >= ACTIVITY_RESUME_GAP else resumed)
+
+    def recent_input(self):
+        now = time.monotonic()
+        with self._state_lock:
+            return {path: (last, resumed) for path, last, resumed in self._inputs.values()
+                    if now - last < ACTIVITY_TIMEOUT}
 
     def wait(self, timeout):
         """设备变更或手动刷新均可唤醒轮询，返回值仅代表设备变更。"""
@@ -1598,28 +1690,32 @@ def hid_devices(force=False):
 
 
 def invalidate_devices():
-    global _HID_DEVS, _LOGITECH_SCAN_DUE
+    global _HID_DEVS
     _HID_DEVS = None
-    _LOGITECH_SCAN_DUE = 0.0
     _HIDPP_CACHE.clear()
+    _RECEIVER_ACTIVITY.clear()
     close_all()
-    for d in DEVICES:
-        d.next_due = 0.0
-        d.fails = 0
 
 
 # ---------------------------------------------------------------- 轮询
 
-def poll_keyboard(devs=None):
+def update_keyboard(devs=None):
     inst = find_compx(devs)
     KB.set_present(bool(inst))
     if not inst:
         _set_error(KB, "未发现接收器")
-        return
+        return None
     receiver = hid_path(inst)
     if KB.receiver != receiver:
         KB.receiver = receiver
         KB.clear_reading()
+    return inst
+
+
+def poll_keyboard(devs=None):
+    inst = update_keyboard(devs)
+    if inst is None:
+        return
     if KB.model_id is None:
         mid, _ = compx_model(inst)
         if mid is not None:
@@ -1641,8 +1737,7 @@ def poll_keyboard(devs=None):
 
 
 def update_logitech(hid_devs, force=False):
-    """更新已知槽位的连接状态，并定期探测之前未应答的槽位。"""
-    global _LOGITECH_SCAN_DUE
+    """更新已知槽位的连接状态。只有手动刷新会主动探测未知槽位。"""
     paths = logitech_paths(hid_devs)
     known = {(d.receiver, d.slot): d for d in DEVICES if d.slot is not None}
     removed = {d.receiver for d in known.values() if d.present} - paths
@@ -1656,7 +1751,9 @@ def update_logitech(hid_devs, force=False):
         for key in list(_HIDPP_CACHE):
             if key[0] in removed:
                 del _HIDPP_CACHE[key]
-    if not force and time.time() < _LOGITECH_SCAN_DUE:
+    for path in set(_RECEIVER_ACTIVITY) - paths:
+        del _RECEIVER_ACTIVITY[path]
+    if not force:
         return
     for path in sorted(paths):
         for slot in range(1, 7):
@@ -1667,7 +1764,10 @@ def update_logitech(hid_devs, force=False):
                 dev = Device(logitech_key(path, slot), "Logitech 设备", path, slot)
                 dev.set_present(True)
                 DEVICES.append(dev)
-    _LOGITECH_SCAN_DUE = time.time() + LOGITECH_SCAN_INTERVAL
+
+
+def needs_hidpp_confirmation(level, previous):
+    return previous is None or abs(level - previous) >= 25 or (level <= 5 and previous > 10)
 
 
 def poll_logitech(dev):
@@ -1692,11 +1792,16 @@ def poll_logitech(dev):
     if not res:
         _set_error(dev, err)
         return
-    if dev.updated is None:
-        # 首读可能不准，复读一次再采用。
+    first = res[0]
+    if needs_hidpp_confirmation(first, dev.level):
         time.sleep(0.15)
         again, _ = hidpp_battery(path, slot)
-        res = again or res
+        if again is None or (needs_hidpp_confirmation(again[0], dev.level) and abs(first - again[0]) > 5):
+            _set_error(dev, HIDPP_UNCONFIRMED)
+            return
+        if abs(first - again[0]) > 5:
+            log("%s 电量复读 %d%% → %d%%，采用复读值" % (dev.display_name(), first, again[0]))
+        res = again
     dev.level, state = res
     dev.charging = state in (1, 2, 3, 4)
     dev.status = BATTERY_STATUS.get(state, "状态 0x%02X" % state)
@@ -1785,6 +1890,7 @@ def next_delay(fails, ok):
 
 
 def poll_device(dev, hid_devs):
+    dev.last_attempt = time.monotonic()
     if dev is KB:
         poll_keyboard(hid_devs)
     elif dev.rapoo_report_len is not None:
@@ -1793,12 +1899,16 @@ def poll_device(dev, hid_devs):
         if dev.present:
             apply_vendor_reading(dev, vendor_battery.read_battery(dev.receiver, dev.vendor_model))
     else:
-        poll_logitech(dev)
+        try:
+            poll_logitech(dev)
+        finally:
+            if dev.receiver in _RECEIVER_ACTIVITY:
+                _RECEIVER_ACTIVITY[dev.receiver].queried_device(dev.slot)
     if dev.error:
         dev.fails += 1
     else:
         dev.fails = 0
-    delay = next_delay(dev.fails, not dev.error)
+    delay = 3 if dev.fails == 1 and dev.error == HIDPP_UNCONFIRMED else next_delay(dev.fails, not dev.error)
     dev.next_due = time.time() + delay
     return delay
 
@@ -1811,7 +1921,112 @@ def poll_all():
     update_rapoo(devs)
     update_vendor_devices(devs)
     for d in DEVICES:
+        d.fails = 0
         poll_device(d, devs)
+
+
+def physical_identity(interface):
+    container = interface.get("container")
+    # Skip absent IDs and Windows' shared machine container.
+    if container and container not in (bytes(16), bytes(8) + b"\xff" * 8):
+        return container, interface["vid"], interface["pid"]
+    return None
+
+
+def input_ready(activity, due, attempted):
+    if activity is None:
+        return False
+    last, resumed = activity
+    return last > attempted and time.monotonic() - last < ACTIVITY_TIMEOUT and (time.time() >= due or resumed > attempted)
+
+
+def read_unifying_activity(receiver, short_path):
+    """Read HID++ register B3 on the receiver itself (address FF)."""
+    link = HidLink(short_path, 20, read_path=receiver)
+    try:
+        report, _ = link.exchange(b"\x10\xff\x83\xb3\0\0\0",
+                                  lambda r: len(r) == 20 and r[:4] == b"\x11\xff\x83\xb3", 0.18)
+        return report[4:10] if report else None
+    finally:
+        link.close()
+
+
+class ReceiverActivity:
+    def __init__(self):
+        self.previous = None
+        self.sampled = self.due = 0.0
+        self.slots = {}
+        self.discovery = {}
+        self.ignore_replies_until = {}
+
+    def observe(self, counters):
+        now = time.monotonic()
+        if counters is not None and self.previous is not None and now - self.sampled < 3:
+            for slot, (old, new) in enumerate(zip(self.previous, counters), 1):
+                if self.sampled >= self.ignore_replies_until.get(slot, 0.0) and old != new:
+                    last, resumed = self.slots.get(slot, (0.0, 0.0))
+                    self.slots[slot] = (now, now if not last or now - last >= ACTIVITY_RESUME_GAP else resumed)
+        self.previous = counters
+        self.sampled = now
+        self.due = now + (1 if counters is not None else 30)
+
+    def queried_device(self, slot):
+        # Replies to our own queries must never count as new device activity.
+        self.ignore_replies_until[slot] = time.monotonic() + 0.5
+
+
+def refresh_logitech_activity(interfaces, hid_devs):
+    known = {(dev.receiver, dev.slot) for dev in DEVICES if dev.slot is not None}
+    for path in logitech_paths(hid_devs):
+        item = interfaces[path]
+        if item.get("usage") != 2 or item["pid"] not in (0xC52B, 0xC532):
+            continue
+        receiver = _RECEIVER_ACTIVITY.setdefault(path, ReceiverActivity())
+        if time.monotonic() >= receiver.due:
+            identity = physical_identity(item)
+            short_path = next((peer_path for peer_path, peer in interfaces.items()
+                               if identity and physical_identity(peer) == identity
+                               and (peer["page"], peer["usage"]) == (0xFF00, 1)
+                               and peer["inl"] == peer["outl"] == 7), None)
+            receiver.observe(read_unifying_activity(path, short_path) if short_path else None)
+        for slot, activity in receiver.slots.items():
+            if (path, slot) in known:
+                continue
+            due, attempted = receiver.discovery.get(slot, (0.0, 0.0))
+            if not input_ready(activity, due, attempted) or poll_window_remaining() <= 0:
+                continue
+            receiver.discovery[slot] = (time.time() + 15, time.monotonic())
+            try:
+                reply = hidpp_request(path, slot, 0, 1, timeout=0.2)
+            finally:
+                receiver.queried_device(slot)
+            if reply and reply[4] in (2, 4):
+                dev = Device(logitech_key(path, slot), "Logitech 设备", path, slot)
+                dev.set_present(True)
+                DEVICES.append(dev)
+
+
+def refresh_active_devices(hid_devs, recent):
+    interfaces = {hid_path(item["inst"]): item for item in hid_devs}
+    active = {}
+    for path, item in interfaces.items():
+        activity = recent.get(item.get("path", path))
+        identity = physical_identity(item)
+        if identity and item["page"] == 1 and item["usage"] in (2, 6) and activity:
+            active[identity] = max(active.get(identity, (0.0, 0.0)), activity)
+
+    refresh_logitech_activity(interfaces, hid_devs)
+    for dev in DEVICES:
+        item = interfaces.get(dev.receiver)
+        if not dev.present or item is None:
+            continue
+        if dev.slot is None:
+            activity = active.get(physical_identity(item))
+        else:
+            receiver = _RECEIVER_ACTIVITY.get(dev.receiver)
+            activity = receiver.slots.get(dev.slot) if receiver else None
+        if input_ready(activity, dev.next_due, dev.last_attempt) and poll_window_remaining() > 0:
+            poll_device(dev, hid_devs)
 
 
 def lowest_level():
@@ -1838,7 +2053,9 @@ def publish_status():
         if key != _TRAY_KEY["value"]:
             ICON.icon = make_image(*key[:3])
             _TRAY_KEY["value"] = key
-        ICON.title = status_text()
+        title = status_text()
+        if ICON.title != title:
+            ICON.title = title
         for dev in DEVICES:
             level = dev.display_level
             if level is None:
@@ -1855,13 +2072,39 @@ def publish_status():
     save_last()
 
 
+def poll_window_remaining():
+    """Seconds left for automatic reads. Moving to the tray and hovering stay passive."""
+    event = LASTINPUTINFO(ctypes.sizeof(LASTINPUTINFO))
+    if not u32.GetLastInputInfo(ctypes.byref(event)):
+        return 0.0
+    elapsed = (k32.GetTickCount() - event.dwTime) & 0xFFFFFFFF
+    if not POLL_INPUT_SETTLE_MS <= elapsed < POLL_IDLE_MS:
+        return 0.0
+    cursor = wt.POINT()
+    if not u32.GetCursorPos(ctypes.byref(cursor)):
+        return 0.0
+    window = u32.WindowFromPoint(cursor)
+    if window:
+        root = u32.GetAncestor(window, 2) or window  # GA_ROOT, without following the owner.
+        # Read the HWND cached by the Tk thread without making Tk calls from the worker.
+        if any(panel._mapped_handle == root for panel in tuple(PANELS)):
+            return 0.0
+        name = ctypes.create_unicode_buffer(128)
+        u32.GetClassNameW(root, name, len(name))
+        if name.value in PASSIVE_TRAY_WINDOWS:
+            return 0.0
+    return (POLL_IDLE_MS - elapsed) / 1000
+
+
 def worker():
     global _WORKER_PROGRESS
     rescan = False
+    inventory = None
     while not _STOP_WORKER.is_set():
         _WORKER_PROGRESS = time.monotonic()
         try:
             if HOTPLUG.take_refresh():
+                rescan = False
                 try:
                     poll_all()
                 except Exception:
@@ -1869,32 +2112,30 @@ def worker():
                     log("手动刷新异常: " + traceback.format_exc())
                 else:
                     HOTPLUG.finish_refresh(ok=True)
+                finally:
+                    close_all()
             else:
                 if rescan:
                     invalidate_devices()
-                now = time.time()
-                if now >= _LOGITECH_SCAN_DUE or any(now >= d.next_due for d in DEVICES):
-                    devs = hid_devices()
+                    rescan = False
+                devs = hid_devices()
+                if devs is not inventory:
+                    update_keyboard(devs)
                     update_logitech(devs)
                     update_rapoo(devs)
                     update_vendor_devices(devs)
-                    for dev in DEVICES:
-                        if time.time() >= dev.next_due:
-                            _WORKER_PROGRESS = time.monotonic()
-                            poll_device(dev, devs)
+                    inventory = devs
+                try:
+                    refresh_active_devices(devs, HOTPLUG.recent_input())
+                finally:
+                    close_all()
             DEVICES[:] = [dev for dev in DEVICES if dev is KB or has_status(dev)]
             publish_status()
         except Exception:
             log("worker 异常: " + traceback.format_exc())
-        # 睡到最近一次轮询或设备发现；插拔时立即唤醒。
-        now = time.time()
-        deadlines = [_LOGITECH_SCAN_DUE, *(d.next_due for d in DEVICES)]
-        deadlines.extend(expiry for d in DEVICES
-                         if (expiry := stale_expiry(d)) is not None and expiry > now)
-        nxt = min(deadlines)
         _WORKER_PROGRESS = time.monotonic()
         if not _STOP_WORKER.is_set():
-            rescan = HOTPLUG.wait(max(1.0, min(60.0, nxt - now)))
+            rescan = HOTPLUG.wait(0.5) or rescan
 
 
 # ---------------------------------------------------------------- 菜单

@@ -74,6 +74,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           case "$GITHUB_REF_NAME" in
-            native-v*) gh release create "$GITHUB_REF_NAME" dist/native-release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --prerelease ;;
-            v*) gh release create "$GITHUB_REF_NAME" dist/python-update/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes ;;
+            native-v*) gh release create "$GITHUB_REF_NAME" dist/native-release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest --title "外设电量 ${GITHUB_REF_NAME#native-v}" ;;
+            v*) gh release create "$GITHUB_REF_NAME" dist/python-update/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --latest=false --title "外设电量 Python ${GITHUB_REF_NAME#v}" ;;
           esac

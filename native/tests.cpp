@@ -7,6 +7,31 @@
 using namespace pbt;
 
 int main() {
+    const auto start = Clock::time_point{20s};
+    ReceiverActivity receiver;
+    ReceiverActivity::Counters counts{};
+    counts[0] = 255;
+    receiver.observe(counts, start);
+    assert(!receiver.slots[0].recent(start));
+    counts[0] = 0; // The receiver's byte counter can wrap.
+    receiver.observe(counts, start + 1s);
+    assert(receiver.slots[0].recent(start + 1s));
+    assert(!receiver.slots[1].recent(start + 1s));
+    PollSchedule schedule{start + 60s, start + 1s};
+    assert(!schedule.ready(receiver.slots[0], start + 1s));
+    receiver.queriedDevice(1, start + 1s);
+    ++counts[0]; // A reply to our own request must not restart the schedule.
+    ++counts[1]; // Real activity on a different slot must still be seen.
+    receiver.observe(counts, start + 2s);
+    assert(receiver.slots[0].last == start + 1s);
+    assert(receiver.slots[1].last == start + 2s);
+    receiver.observe(counts, start + 20s);
+    ++counts[0];
+    receiver.observe(counts, start + 21s);
+    assert(schedule.ready(receiver.slots[0], start + 21s));
+    assert(!schedule.ready(receiver.slots[0], start + 26s));
+    assert(!schedule.ready(receiver.slots[1], start + 60s));
+
     std::array<std::uint8_t, 20> compx{0x13, 0xca, 0, 0, 0, 68, 1};
     compx[19] = checksum(Report(compx).first(19));
     assert(compxReading(compx)->level == 68);
@@ -20,6 +45,10 @@ int main() {
     assert(!compxModelName(0xff));
 
     std::array<std::uint8_t, 20> hidpp{0x11, 2, 5, 1, 42, 0, 5};
+    assert(hidppReply(hidpp, 2, 5, 1));
+    assert(!hidppReply(hidpp, 2, 5, 2)); // Late answer from a previous query.
+    assert(!hidppReply(hidpp, 2, 5, 0x11)); // Reply to a different function.
+    assert(!hidppReply(Report(hidpp).first(7), 2, 5, 1));
     assert(hidppReading(hidpp, false)->fault);
     assert(!hidppReading(Report(hidpp).first(7), true)); // Unified Battery needs its external power byte.
     hidpp[4] = 0;
@@ -32,6 +61,18 @@ int main() {
     assert(std::wstring_view(hidppDeviceKind(3)) == L"鼠标");
     assert(std::wstring_view(hidppDeviceKind(5)) == L"轨迹球");
     assert(std::wstring_view(hidppDeviceKind(0xff)) == L"外设");
+
+    assert(needsHidppConfirmation(4, 90));
+    assert(needsHidppConfirmation(4, 20));
+    assert(!needsHidppConfirmation(89, 90));
+    assert(!needsHidppConfirmation(4, 5));
+    assert(!confirmHidppReading(4, std::nullopt, 90));
+    assert(!confirmHidppReading(4, Reading{90}, std::nullopt));
+    assert(!confirmHidppReading(4, Reading{50}, 90));
+    const auto corrected = confirmHidppReading(4, Reading{90}, 90);
+    assert(corrected && corrected->level == 90);
+    const auto confirmedLow = confirmHidppReading(4, Reading{4}, 90);
+    assert(confirmedLow && confirmedLow->level == 4);
 
     std::array<std::uint8_t, 7> vt{0xbb, 0xb0, 0, 0, 0, 2, 0x7f};
     const auto unknownWhileCharging = rapooReading(vt, 7);

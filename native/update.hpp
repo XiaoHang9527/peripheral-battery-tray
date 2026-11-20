@@ -8,7 +8,7 @@
 
 namespace pbt {
 
-inline constexpr auto version = L"0.1.1";
+inline constexpr auto version = L"0.1.2";
 inline constexpr auto nativeExe = L"peripheral-battery-tray-native.exe";
 
 struct UpdateResult {

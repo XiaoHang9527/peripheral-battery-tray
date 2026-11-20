@@ -34,7 +34,8 @@ def test_latest_release_requires_verified_asset(monkeypatch):
     asset = {"name": app_update.ASSET_NAME, "size": release.size,
              "digest": "sha256:" + release.digest, "browser_download_url": release.url}
     metadata = {"tag_name": release.tag, "assets": [asset]}
-    monkeypatch.setattr(app_update, "_get", lambda *_: json.dumps(metadata).encode())
+    native = {"tag_name": "native-v0.1.2", "assets": []}
+    monkeypatch.setattr(app_update, "_get", lambda *_: json.dumps([native, {"tag_name": "vnext"}, metadata]).encode())
     assert app_update.latest_release() == release
     metadata["prerelease"] = True
     assert app_update.latest_release() is None

@@ -49,14 +49,26 @@ def _get(url, limit):
 
 def latest_release():
     try:
-        data = json.loads(_get(f"https://api.github.com/repos/{REPOSITORY}/releases/latest", MAX_ARCHIVE))
+        releases = json.loads(_get(f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=30", MAX_ARCHIVE))
     except HTTPError as exc:
         if exc.code == 404:
             return None
         raise
-    tag = data["tag_name"]
-    if data.get("draft") or data.get("prerelease") or version_number(tag) <= version_number(APP_VERSION):
+    newest = version_number(APP_VERSION)
+    data = None
+    for release in releases:
+        tag = release.get("tag_name")
+        if not isinstance(tag, str) or not tag.startswith("v") or release.get("draft") or release.get("prerelease"):
+            continue
+        try:
+            number = version_number(tag)
+        except ValueError:
+            continue
+        if number > newest:
+            newest, data = number, release
+    if data is None:
         return None
+    tag = data["tag_name"]
     expected_url = f"https://github.com/{REPOSITORY}/releases/download/{tag}/{ASSET_NAME}"
     for asset in data.get("assets", ()):
         if asset.get("name") != ASSET_NAME:

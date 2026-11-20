@@ -50,7 +50,6 @@ hid.HidD_FlushQueue.restype = ctypes.c_ubyte
 hid.HidD_GetFeature.argtypes = hid.HidD_SetFeature.argtypes = [
     wt.HANDLE, ctypes.c_void_p, wt.ULONG]
 hid.HidD_GetFeature.restype = hid.HidD_SetFeature.restype = ctypes.c_ubyte
-hid.HidD_GetProductString.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.ULONG]
 hid.HidD_GetPreparsedData.argtypes = [wt.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
 hid.HidD_FreePreparsedData.argtypes = [ctypes.c_void_p]
 hid.HidP_GetCaps.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -66,12 +65,19 @@ setupapi.SetupDiGetDeviceInterfaceDetailW.argtypes = [
 setupapi.SetupDiGetDeviceInstanceIdW.argtypes = [
     ctypes.c_void_p, ctypes.c_void_p, wt.LPWSTR, wt.DWORD,
     ctypes.POINTER(wt.DWORD)]
+setupapi.SetupDiGetDevicePropertyW.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wt.ULONG),
+    ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD), wt.DWORD]
 setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
 
 
 class GUID(ctypes.Structure):
     _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
                 ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
+
+
+class DEVPROPKEY(ctypes.Structure):
+    _fields_ = [("fmtid", GUID), ("pid", wt.ULONG)]
 
 
 class IFDATA(ctypes.Structure):
@@ -103,6 +109,8 @@ class CAPS(ctypes.Structure):
 
 GUID_HID = GUID(0x4D1E55B2, 0xF16F, 0x11CF,
                 (ctypes.c_ubyte * 8)(0x88, 0xCB, 0, 0x11, 0x11, 0, 0, 0x30))
+CONTAINER_ID = DEVPROPKEY(GUID(0x8C7ED206, 0x3F8A, 0x4827,
+                              (ctypes.c_ubyte * 8)(0xB3, 0xAB, 0xAE, 0x9E, 0x1F, 0xAE, 0xFC, 0x6C)), 2)
 
 
 def hid_path(inst):
@@ -144,10 +152,12 @@ def enum_hid():
             continue
         iid = ctypes.create_unicode_buffer(512)
         n = wt.DWORD(0)
-        setupapi.SetupDiGetDeviceInstanceIdW(
-            hdev, ctypes.byref(dd), iid, 512, ctypes.byref(n))
+        if not setupapi.SetupDiGetDeviceInstanceIdW(
+                hdev, ctypes.byref(dd), iid, 512, ctypes.byref(n)):
+            continue
         inst = iid.value
-        h = k32.CreateFileW(hid_path(inst), 0, 3, None, 3, 0, None)
+        path = ctypes.wstring_at(ctypes.addressof(buf) + ctypes.sizeof(wt.DWORD)).lower()
+        h = k32.CreateFileW(path, 0, 3, None, 3, 0, None)
         if h in (None, wt.HANDLE(-1).value):
             continue
         try:
@@ -155,9 +165,6 @@ def enum_hid():
             a.Size = ctypes.sizeof(a)
             if not hid.HidD_GetAttributes(h, ctypes.byref(a)):
                 continue
-            pb = ctypes.create_unicode_buffer(256)
-            has_name = bool(hid.HidD_GetProductString(h, pb,
-                                                      ctypes.sizeof(pb)))
             pp = ctypes.c_void_p()
             cap = None
             if hid.HidD_GetPreparsedData(h, ctypes.byref(pp)) and pp:
@@ -167,11 +174,15 @@ def enum_hid():
                 hid.HidD_FreePreparsedData(pp)
             if cap is None:
                 continue
+            container, prop_type, size = GUID(), wt.ULONG(), wt.DWORD()
+            ok = setupapi.SetupDiGetDevicePropertyW(hdev, ctypes.byref(dd), ctypes.byref(CONTAINER_ID),
+                                                    ctypes.byref(prop_type), ctypes.byref(container),
+                                                    ctypes.sizeof(container), ctypes.byref(size), 0)
             out.append({"inst": inst, "vid": a.VendorID, "pid": a.ProductID,
                         "page": cap.UsagePage, "usage": cap.Usage,
                         "inl": cap.InLen, "outl": cap.OutLen,
-                        "featl": cap.FeatLen,
-                        "product": pb.value if has_name else ""})
+                        "featl": cap.FeatLen, "path": path,
+                        "container": bytes(container) if ok and prop_type.value == 0x0D and size.value == 16 else None})
         finally:
             k32.CloseHandle(h)
     setupapi.SetupDiDestroyDeviceInfoList(hdev)
@@ -369,8 +380,9 @@ def feature_exchange(path, request, delay):
 class HidLink:
     """一个 HID 集合的常驻连接，独立句柄读写，同一时间只处理一个请求。"""
 
-    def __init__(self, path, read_len=256):
+    def __init__(self, path, read_len=256, *, read_path=None):
         self.path = path
+        self.read_path = read_path or path
         self.read_len = read_len
         self._io = threading.Lock()
         self._hw = None
@@ -381,7 +393,7 @@ class HidLink:
                              FILE_FLAG_OVERLAPPED, None)
         if hw in INVALID_HANDLES:
             return False
-        hr = k32.CreateFileW(self.path, 0x80000000, 3, None, 3,
+        hr = k32.CreateFileW(self.read_path, 0x80000000, 3, None, 3,
                              FILE_FLAG_OVERLAPPED, None)
         if hr in INVALID_HANDLES:
             k32.CloseHandle(hw)
@@ -405,7 +417,7 @@ class HidLink:
                     return None, got
                 buf = ctypes.create_string_buffer(self.read_len)
                 while time.monotonic() < deadline:
-                    count = _transfer(k32.ReadFile, self._hr, buf, deadline, self.path)
+                    count = _transfer(k32.ReadFile, self._hr, buf, deadline, self.read_path)
                     if not count:
                         break
                     frame = buf.raw[:count]

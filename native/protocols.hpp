@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -19,6 +20,7 @@ struct Reading {
     bool charging = false;
     bool wired = false;
     bool fault = false;
+    bool operator==(const Reading&) const = default;
 };
 
 inline std::uint8_t checksum(Report data) {
@@ -58,6 +60,11 @@ inline const wchar_t* hidppDeviceKind(unsigned kind) {
     }
 }
 
+inline bool hidppReply(Report frame, unsigned slot, unsigned feature, unsigned command) {
+    return frame.size() == hidppLength && frame[0] == 0x11 && frame[1] == slot
+        && frame[2] == feature && frame[3] == command;
+}
+
 inline std::optional<Reading> hidppReading(Report frame, bool unified) {
     // HID++ 0x1000 and 0x1004 use different charge-state tables.
     // See Logitech's cpg-docs and hid-logitech-hidpp's unified battery mapping.
@@ -66,6 +73,18 @@ inline std::optional<Reading> hidppReading(Report frame, bool unified) {
     const int status = frame[6];
     return Reading{frame[4], status >= 1 && status <= (unified ? 3 : 4), false,
                    unified ? status >= 4 : status >= 5};
+}
+
+inline bool needsHidppConfirmation(int level, std::optional<int> previous) {
+    return !previous || std::abs(level - *previous) >= 25 || (level <= 5 && *previous > 10);
+}
+
+inline std::optional<Reading> confirmHidppReading(int first, std::optional<Reading> second,
+                                                 std::optional<int> previous) {
+    if (!second || !second->level) return std::nullopt;
+    // Prefer a return to the previous range, or accept a change corroborated by the re-read.
+    if (!needsHidppConfirmation(*second->level, previous) || std::abs(first - *second->level) <= 5) return second;
+    return std::nullopt;
 }
 
 inline std::optional<Reading> rapooReading(Report frame, unsigned reportLength) {

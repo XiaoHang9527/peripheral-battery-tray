@@ -16,7 +16,9 @@
 #include <condition_variable>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <string_view>
 #include <thread>
 #include <utility>
 
@@ -40,6 +42,28 @@ constexpr UINT ringPulseTimer = 5;
 constexpr UINT updateCleanupTimer = 6;
 constexpr UINT hoverDelay = 180;
 constexpr UINT trayId = 1;
+constexpr DWORD pollIdleMs = 15'000;
+constexpr DWORD pollInputSettleMs = 400;
+
+DWORD inputIdleMs() {
+    LASTINPUTINFO input{sizeof(input), 0};
+    return GetLastInputInfo(&input) ? GetTickCount() - input.dwTime : pollIdleMs;
+}
+
+bool canPollAutomatically() {
+    const auto idleMs = inputIdleMs();
+    if (idleMs < pollInputSettleMs || idleMs >= pollIdleMs) return false;
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) return false;
+    const auto window = WindowFromPoint(cursor);
+    const auto root = window ? GetAncestor(window, GA_ROOT) : nullptr;
+    wchar_t name[128]{};
+    if (window) GetClassNameW(root ? root : window, name, std::size(name));
+    constexpr std::wstring_view passiveWindows[]{ringClass, L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
+        L"NotifyIconOverflowWindow", L"TopLevelWindowForOverflowXamlIsland"};
+    return std::find(std::begin(passiveWindows), std::end(passiveWindows), std::wstring_view(name))
+        == std::end(passiveWindows);
+}
 
 enum Control : int {
     overviewTab = 100, settingsTab, list, renameEdit, rename, toggleRing, refresh, more, startup,
@@ -105,6 +129,7 @@ std::wstring description(const Device& device) {
         if (device.fresh) return L"蓝牙已连接";
         return device.displayLevel() ? L"蓝牙已连接 · 上次读数" : L"蓝牙已连接 · 暂无电量";
     }
+    if (device.readingUnconfirmed) return device.displayLevel() ? L"电量待确认 · 上次读数" : L"电量待确认";
     if (!device.fresh) return device.updated.time_since_epoch().count() ? L"暂未响应 · 上次读数" : L"正在等待读数";
     if (device.reading.wired) return L"已接线 · 电量未知";
     if (device.reading.fault) return L"电池状态异常";
@@ -143,8 +168,7 @@ public:
         : instance_(instance), directory_(std::move(directory)), preferences_(directory_),
           options_(preferences_.load()), preview_(options_), workerOptions_(options_) {}
     ~App() {
-        stop_ = true;
-        wake_.notify_one();
+        stopWorker();
         if (worker_.joinable()) worker_.join();
         if (updater_.joinable()) updater_.join();
         discardUpdate(staged_);
@@ -165,13 +189,16 @@ private:
     static LRESULT CALLBACK deviceListProc(HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
     bool registerClass(const wchar_t* name, WNDPROC procedure);
     void work();
+    void stopWorker();
     std::uint64_t requestRefresh(bool showStatus);
-    void retryOnActivity();
+    void requestRescan();
+    void recordInput(HRAWINPUT input);
     void acceptSample();
     void diagnose(const std::wstring& message) const;
     void publishTray();
     TOOLINFOW trayTool();
-    void trackTrayTip(bool show, LPARAM position = 0);
+    void trackTrayTip(bool show);
+    bool positionTrayTip();
     void trayMenu();
     bool deviceMenu(HWND listWindow, POINT screenPoint, bool fromButton);
     void notifyLow();
@@ -184,6 +211,7 @@ private:
     void paintHoverCard(HWND window);
     void toggleTaskbarRings();
     void openPanel(bool toSettings, RECT anchor, const std::wstring& key = {});
+    std::optional<RECT> trayIconBounds() const;
     RECT trayAnchor() const;
     void createControls();
     void placeControls(bool batchPositions = true);
@@ -234,6 +262,7 @@ private:
     Badge trayBadge_{};
     int trayIconSize_ = 0;
     std::wstring trayTipText_ = L"外设电量";
+    std::optional<RECT> trayTipAnchor_;
     bool trayAdded_ = false, settings_ = false, expanded_ = false, checking_ = false;
     bool keepOpen_ = false;
     bool pulsing_ = false;
@@ -270,9 +299,9 @@ private:
     std::mutex lock_;
     std::condition_variable wake_;
     Options workerOptions_;
-    bool retryLogitech_ = false;
-    Clock::time_point nextActivityRetry_{};
-    std::uint64_t requestedRefresh_ = 1, sampleRefresh_ = 0;
+    bool rescanRequested_ = false;
+    std::map<HANDLE, std::pair<std::wstring, InputActivity>> rawInputs_;
+    std::uint64_t requestedRefresh_ = 0, sampleRefresh_ = 0;
     std::uint64_t completedRefresh_ = 0, panelRefresh_ = 0, hoverRefresh_ = 0;
     std::vector<Device> sample_;
     std::vector<std::wstring> sampleDiagnostics_;
@@ -327,6 +356,13 @@ bool App::start() {
     filter.dbcc_size = sizeof(filter);
     filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
     hotplug_ = RegisterDeviceNotificationW(host_, &filter, DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
+    const RAWINPUTDEVICE inputs[]{
+        {1, 2, RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, host_},
+        {1, 6, RIDEV_INPUTSINK | RIDEV_DEVNOTIFY, host_},
+    };
+    if (!RegisterRawInputDevices(inputs, std::size(inputs), sizeof(RAWINPUTDEVICE))) {
+        diagnose(L"无法监听外设活动，可使用手动刷新");
+    }
     SetTimer(host_, styleTimer, 1000, nullptr);
     SetTimer(host_, updateCleanupTimer, 5000, nullptr);
     publishTray();
@@ -346,10 +382,17 @@ LRESULT CALLBACK App::hostProc(HWND window, UINT message, WPARAM wparam, LPARAM 
         return 0;
     }
     switch (message) {
+    case WM_NOTIFY: {
+        const auto* notice = reinterpret_cast<const NMHDR*>(lparam);
+        if (notice && notice->hwndFrom == app->trayTip_ && notice->code == TTN_SHOW) {
+            return app->positionTrayTip();
+        }
+        break;
+    }
     case trayMessage:
         switch (LOWORD(lparam)) {
         case NIN_POPUPOPEN:
-            app->trackTrayTip(true, wparam);
+            app->trackTrayTip(true);
             break;
         case NIN_POPUPCLOSE:
             app->trackTrayTip(false);
@@ -384,8 +427,23 @@ LRESULT CALLBACK App::hostProc(HWND window, UINT message, WPARAM wparam, LPARAM 
             SetTimer(window, deviceTimer, 300, nullptr);
         }
         return TRUE;
+    case WM_INPUT:
+        app->recordInput(reinterpret_cast<HRAWINPUT>(lparam));
+        break; // DefWindowProc releases foreground raw-input messages.
+    case WM_INPUT_DEVICE_CHANGE:
+        if (wparam == GIDC_REMOVAL) {
+            std::lock_guard guard(app->lock_);
+            app->rawInputs_.erase(reinterpret_cast<HANDLE>(lparam));
+        }
+        return 0;
     case WM_POWERBROADCAST:
-        if (wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND) app->requestRefresh(false);
+        if (wparam == PBT_APMRESUMESUSPEND || wparam == PBT_APMRESUMEAUTOMATIC) {
+            {
+                std::lock_guard guard(app->lock_);
+                app->rawInputs_.clear();
+            }
+            app->requestRescan();
+        }
         return TRUE;
     case WM_DISPLAYCHANGE:
     case WM_THEMECHANGED:
@@ -398,7 +456,7 @@ LRESULT CALLBACK App::hostProc(HWND window, UINT message, WPARAM wparam, LPARAM 
     case WM_TIMER:
         if (wparam == deviceTimer) {
             KillTimer(window, deviceTimer);
-            app->requestRefresh(false);
+            app->requestRescan();
         } else if (wparam == trayPanelTimer) {
             KillTimer(window, trayPanelTimer);
             app->openPanel(false, app->pendingTrayAnchor_);
@@ -413,7 +471,6 @@ LRESULT CALLBACK App::hostProc(HWND window, UINT message, WPARAM wparam, LPARAM 
             cleanupUpdateStages();
         } else if (wparam == styleTimer) {
             if (!app->trayAdded_) app->publishTray();
-            app->retryOnActivity();
             app->updateRings();
         }
         return 0;
@@ -421,8 +478,7 @@ LRESULT CALLBACK App::hostProc(HWND window, UINT message, WPARAM wparam, LPARAM 
         DestroyWindow(window);
         return 0;
     case WM_DESTROY: {
-        app->stop_ = true;
-        app->wake_.notify_one();
+        app->stopWorker();
         if (app->hotplug_) UnregisterDeviceNotification(app->hotplug_);
         NOTIFYICONDATAW icon{};
         icon.cbSize = sizeof(icon);
@@ -550,33 +606,44 @@ LRESULT CALLBACK App::hoverProc(HWND window, UINT message, WPARAM wparam, LPARAM
 
 void App::work() {
     Scanner scanner;
-    Options options;
     std::uint64_t processed = 0;
+    std::unique_lock guard(lock_);
     while (!stop_) {
-        std::uint64_t request;
-        bool retryLogitech;
-        {
-            std::lock_guard guard(lock_);
-            options = workerOptions_;
-            request = requestedRefresh_;
-            retryLogitech = std::exchange(retryLogitech_, false);
+        const bool rescan = std::exchange(rescanRequested_, false);
+        const auto request = requestedRefresh_;
+        const bool manual = request != processed;
+        const auto now = Clock::now();
+        InputActivities recent;
+        for (const auto& [handle, input] : rawInputs_) {
+            if (!input.first.empty() && input.second.recent(now)) recent.emplace(input);
         }
-        auto result = scanner.sample(stop_, options.interval, options.retention, request != processed, retryLogitech);
-        auto diagnostics = takeHidDiagnostics();
-        if (stop_) break;
-        processed = request;
-        {
-            std::lock_guard guard(lock_);
-            sample_ = std::move(result);
-            for (auto& message : diagnostics) sampleDiagnostics_.push_back(std::move(message));
-            sampleRefresh_ = processed;
+        if (manual || rescan || !recent.empty() || now >= scanner.nextWake(workerOptions_.retention)) {
+            const auto options = workerOptions_;
+            guard.unlock();
+            auto result = scanner.sample(stop_, options.interval, options.retention, manual, rescan, recent, canPollAutomatically);
+            auto diagnostics = takeHidDiagnostics();
+            guard.lock();
+            if (stop_) break;
+            processed = request;
+            if (manual || result != sample_ || !diagnostics.empty()) {
+                sample_ = std::move(result);
+                for (auto& message : diagnostics) sampleDiagnostics_.push_back(std::move(message));
+                sampleRefresh_ = processed;
+                PostMessageW(host_, sampleMessage, 0, 0);
+            }
         }
-        PostMessageW(host_, sampleMessage, 0, 0);
-        std::unique_lock guard(lock_);
-        wake_.wait_until(guard, scanner.nextWake(options.retention), [&] {
-            return stop_ || requestedRefresh_ != processed || retryLogitech_;
+        wake_.wait_for(guard, std::chrono::milliseconds(500), [&] {
+            return stop_ || requestedRefresh_ != processed || rescanRequested_;
         });
     }
+}
+
+void App::stopWorker() {
+    {
+        std::lock_guard guard(lock_);
+        stop_ = true;
+    }
+    wake_.notify_one();
 }
 
 std::uint64_t App::requestRefresh(bool showStatus) {
@@ -595,18 +662,35 @@ std::uint64_t App::requestRefresh(bool showStatus) {
     return request;
 }
 
-void App::retryOnActivity() {
-    const auto now = Clock::now();
-    if (now < nextActivityRetry_ ||
-        !std::any_of(devices_.begin(), devices_.end(), &Device::awaitingLogitechReply)) return;
-    LASTINPUTINFO input{sizeof(input), 0};
-    if (!GetLastInputInfo(&input) || GetTickCount() - input.dwTime > 2000) return;
-    nextActivityRetry_ = now + std::chrono::seconds(10);
+void App::requestRescan() {
     {
         std::lock_guard guard(lock_);
-        retryLogitech_ = true;
+        workerOptions_ = options_;
+        rescanRequested_ = true;
     }
     wake_.notify_one();
+}
+
+void App::recordInput(HRAWINPUT input) {
+    RAWINPUTHEADER header{};
+    UINT size = sizeof(header);
+    if (GetRawInputData(input, RID_HEADER, &header, &size, sizeof(header)) != sizeof(header)
+        || !header.hDevice || (header.dwType != RIM_TYPEMOUSE && header.dwType != RIM_TYPEKEYBOARD)) return;
+    std::lock_guard guard(lock_);
+    auto [it, added] = rawInputs_.try_emplace(header.hDevice);
+    auto& [path, activity] = it->second;
+    if (added) {
+        UINT length = 0;
+        if (GetRawInputDeviceInfoW(header.hDevice, RIDI_DEVICENAME, nullptr, &length) == 0 && length > 1) {
+            path.resize(length);
+            if (GetRawInputDeviceInfoW(header.hDevice, RIDI_DEVICENAME, path.data(), &length) == UINT(-1)) path.clear();
+            else {
+                path.resize(wcslen(path.c_str()));
+                CharUpperBuffW(path.data(), static_cast<DWORD>(path.size()));
+            }
+        }
+    }
+    if (!path.empty()) activity.observe(Clock::now());
 }
 
 void App::acceptSample() {
@@ -634,6 +718,8 @@ void App::acceptSample() {
         if (devices_.empty()) status_ = L"未检测到受支持的设备";
         else if (std::any_of(devices_.begin(), devices_.end(), [](const Device& device) { return device.fresh; })) {
             status_ = L"已刷新设备";
+        } else if (std::any_of(devices_.begin(), devices_.end(), [](const Device& device) { return device.readingUnconfirmed; })) {
+            status_ = L"电量待确认 · 可再次刷新";
         } else status_ = L"刷新未收到设备应答";
     }
     updateRings();
@@ -697,13 +783,19 @@ Badge App::badge(const Device& device, bool darkTheme) const {
             level >= 0 && level <= options_.low && !device.reading.fault};
 }
 
-RECT App::trayAnchor() const {
+std::optional<RECT> App::trayIconBounds() const {
     NOTIFYICONIDENTIFIER item{};
     item.cbSize = sizeof(item);
     item.hWnd = host_;
     item.uID = trayId;
     RECT result{};
-    if (SUCCEEDED(Shell_NotifyIconGetRect(&item, &result))) return result;
+    if (SUCCEEDED(Shell_NotifyIconGetRect(&item, &result)) && !IsRectEmpty(&result)
+        && MonitorFromRect(&result, MONITOR_DEFAULTTONULL)) return result;
+    return std::nullopt;
+}
+
+RECT App::trayAnchor() const {
+    if (const auto bounds = trayIconBounds()) return *bounds;
     POINT cursor{};
     GetCursorPos(&cursor);
     return {cursor.x, cursor.y, cursor.x + 1, cursor.y + 1};
@@ -712,23 +804,45 @@ RECT App::trayAnchor() const {
 TOOLINFOW App::trayTool() {
     TOOLINFOW tool{};
     tool.cbSize = TTTOOLINFOW_V2_SIZE;
-    tool.uFlags = TTF_TRACK | TTF_TRANSPARENT;
+    tool.uFlags = TTF_TRACK | TTF_ABSOLUTE | TTF_TRANSPARENT;
     tool.hwnd = host_;
     tool.uId = trayId;
     tool.lpszText = trayTipText_.data();
     return tool;
 }
 
-void App::trackTrayTip(bool show, LPARAM position) {
+void App::trackTrayTip(bool show) {
     if (!trayTip_) return;
-    if (show) {
-        const auto colors = palette(useDark(options_.theme));
-        SendMessageW(trayTip_, TTM_SETTIPBKCOLOR, colors.card, 0);
-        SendMessageW(trayTip_, TTM_SETTIPTEXTCOLOR, colors.text, 0);
-        SendMessageW(trayTip_, TTM_TRACKPOSITION, 0, position);
-    }
+    trayTipAnchor_.reset();
     auto tool = trayTool();
+    if (show) {
+        trayTipAnchor_ = trayIconBounds();
+        POINT cursor{};
+        if (!trayTipAnchor_ && GetCursorPos(&cursor) && MonitorFromPoint(cursor, MONITOR_DEFAULTTONULL)) {
+            trayTipAnchor_ = RECT{cursor.x, cursor.y, cursor.x + 1, cursor.y + 1};
+        }
+        show = trayTipAnchor_.has_value();
+        if (show) {
+            const auto colors = palette(useDark(options_.theme));
+            SendMessageW(trayTip_, TTM_SETTIPBKCOLOR, colors.card, 0);
+            SendMessageW(trayTip_, TTM_SETTIPTEXTCOLOR, colors.text, 0);
+            SendMessageW(trayTip_, TTM_TRACKPOSITION, 0, MAKELPARAM(trayTipAnchor_->left, trayTipAnchor_->top));
+        }
+    }
     SendMessageW(trayTip_, TTM_TRACKACTIVATE, show, reinterpret_cast<LPARAM>(&tool));
+}
+
+bool App::positionTrayTip() {
+    // The tooltip has its measured size when the control sends TTN_SHOW.
+    RECT current{};
+    if (!trayTipAnchor_ || !GetWindowRect(trayTip_, &current) || IsRectEmpty(&current)) return false;
+    RECT icon = *trayTipAnchor_;
+    const POINT anchor{icon.right - 1, icon.top};
+    const SIZE size{current.right - current.left, current.bottom - current.top};
+    RECT popup{};
+    return CalculatePopupWindowPosition(&anchor, &size,
+               TPM_RIGHTALIGN | TPM_BOTTOMALIGN | TPM_VERTICAL | TPM_WORKAREA, &icon, &popup)
+        && SetWindowPos(trayTip_, nullptr, popup.left, popup.top, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
 }
 
 void App::publishTray() {
@@ -788,6 +902,7 @@ void App::publishTray() {
         // Refresh the open tooltip instead of waiting for Explorer to reopen it.
         SendMessageW(trayTip_, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&tool));
         SendMessageW(trayTip_, TTM_UPDATE, 0, 0);
+        if (IsWindowVisible(trayTip_)) positionTrayTip();
     }
     if (trayAdded_ && Shell_NotifyIconW(NIM_MODIFY, &item)) return;
     trayAdded_ = Shell_NotifyIconW(NIM_ADD, &item);
@@ -982,9 +1097,10 @@ void App::updateHoverCard() {
     HoverReading card;
     card.title = name(*device);
     card.level = displayLevel(*device);
-    card.caption = !known ? L"电量未知" : historical ? L"上次电量" : L"当前电量";
+    card.caption = known ? L"上次电量" : L"电量未知";
     if (!device->present) card.status = L"已断开";
     else if (device->bluetooth) card.status = reading.low && device->fresh ? L"低电量" : L"蓝牙已连接";
+    else if (device->readingUnconfirmed) card.status = L"电量待确认";
     else if (!device->fresh) card.status = L"未收到应答";
     else if (device->reading.wired) card.status = L"已接线";
     else if (device->reading.fault) card.status = L"电池状态异常";
@@ -993,7 +1109,7 @@ void App::updateHoverCard() {
     if (hoverRefresh_ > completedRefresh_) card.updated = L"正在刷新…";
     else if (device->bluetooth && !device->updated.time_since_epoch().count()) card.updated = L"尚未收到 Windows 电量";
     else if (device->bluetooth && historical) card.updated = L"上次读取于 " + clockText(device->updated);
-    else if (hoverRefresh_ && historical) card.updated = L"刷新未收到设备应答";
+    else if (hoverRefresh_ && historical && !device->readingUnconfirmed) card.updated = L"刷新未收到设备应答";
     else if (!device->updated.time_since_epoch().count()) card.updated = L"尚未读取电量";
     else if (historical) card.updated = L"上次应答于 " + clockText(device->updated);
     else {
@@ -1625,7 +1741,7 @@ void App::applySettings() {
         placeControls();
         refreshList();
         SetFocus(controls_[list]);
-        requestRefresh(false);
+        requestRescan();
         publishTray();
         updateRings();
         diagnose(L"设置已保存");
