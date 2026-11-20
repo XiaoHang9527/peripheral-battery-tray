@@ -133,7 +133,10 @@ def test_hidpp_status_names_cover_protocol():
     """协议定义 0..6 都要有中文名，未知状态走兜底。"""
     for code in range(7):
         assert code in kb.BATTERY_STATUS
-    assert 0 not in (kb.BATTERY_STATUS.get(7, None),)
+
+
+def test_unified_battery_preserves_percent_when_charge_state_is_unknown():
+    assert kb.parse_hidpp_unified_battery(bytes.fromhex("11 01 08 11 2d 02 ff 00")) == (45, 5)
 
 
 # ---------------------------------------------------------------- 帧匹配
@@ -225,6 +228,58 @@ def test_hidpp_feature_retries_timeout_and_caches_valid_reply(monkeypatch, featu
     assert kb.hidpp_feature("receiver", 1, kb.HIDPP_BATTERY) == feature_index
     assert kb.hidpp_feature("receiver", 1, kb.HIDPP_BATTERY) == feature_index
     assert len(calls) == 2
+
+
+def test_compx_prefers_original_receiver_and_accepts_matching_vendor_interface():
+    extra = dict(vid=0x3554, pid=0xFB40, page=0xFF04, usage=2,
+                 inl=20, outl=20, inst="extra")
+    primary = dict(extra, pid=0xFA09, page=0xFF02, inst="primary")
+    assert kb.find_compx([extra, primary]) == "primary"
+    assert kb.find_compx([extra]) == "extra"
+    assert kb.find_compx([dict(extra, usage=1), dict(extra, outl=0)]) is None
+
+
+def test_logitech_unified_battery_checks_percentage_capability(monkeypatch):
+    monkeypatch.setattr(kb, "_HIDPP_CACHE", {})
+    monkeypatch.setattr(kb, "hidpp_feature", lambda path, slot, feat: 0 if feat == 0x1000 else 8)
+    calls = []
+
+    def request(path, slot, feature, function):
+        calls.append(function)
+        payload = bytes([0, 2 if slot == 1 else 0, 0, 0]) if function == 0 else bytes([0, 1, 2, 1])
+        return bytes([0x11, slot, feature, (function << 4) | 1]) + payload
+
+    monkeypatch.setattr(kb, "hidpp_request", request)
+    assert kb.hidpp_battery("bolt", 1) == ((0, 4), None)
+    assert kb.hidpp_battery("bolt", 1) == ((0, 4), None)
+    assert kb.hidpp_battery("bolt", 2)[0] is None
+    assert calls == [0, 1, 1, 0]
+
+
+def test_rapoo_hotplug_reads_only_documented_receiver_and_preserves_last_level(monkeypatch):
+    receiver = dict(vid=0x24AE, pid=0x1233, page=0xFF00, usage=2, inl=7, outl=0, inst="vt")
+    m350 = dict(receiver, pid=0x187B, usage=0x0E, inl=32, outl=32, inst="m350")
+    monkeypatch.setattr(kb, "DEVICES", [])
+    kb.update_rapoo([receiver, m350, dict(receiver, usage=1, inst="other")])
+    mouse, = kb.DEVICES
+    assert mouse.present and mouse.name == "Rapoo VT1 Pro Max"
+
+    def read(path, length, match, timeout):
+        assert path == mouse.receiver and length == 7 and timeout == 5
+        report = bytes.fromhex("BB B0 71 84 03 01 64")
+        assert match(report) and not match(b"\x00" * length)
+        return report
+
+    monkeypatch.setattr(kb, "read_input_report", read)
+    kb.poll_device(mouse, [receiver])
+    assert mouse.level == 100 and not mouse.error
+    kb.update_rapoo([m350])
+    assert not mouse.present and mouse.level == 100
+    kb.update_rapoo([receiver, m350])
+    assert kb.DEVICES == [mouse] and mouse.next_due == 0.0
+    monkeypatch.setattr(kb, "read_input_report", lambda *args, **kwargs: None)
+    kb.poll_device(mouse, [receiver])
+    assert mouse.level == 100 and mouse.error
 
 
 def test_logitech_polls_each_slot_and_discovers_devices_after_wakeup(monkeypatch):

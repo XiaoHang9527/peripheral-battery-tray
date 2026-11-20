@@ -118,6 +118,48 @@ def test_current_settings_roundtrip(cfg):
     assert snap["show"] == {"device": True, "mouse": True}
 
 
+def test_theme_preference_saves_and_falls_back_for_old_configs(cfg, tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    monkeypatch.setattr(kb, "CONFIG", str(path))
+    path.write_text("{}", encoding="utf-8")
+    assert kb.load_config()["theme"] == "system"
+    path.write_text('{"theme": []}', encoding="utf-8")
+    assert kb.load_config()["theme"] == "system"
+
+    for theme in ("light", "dark", "system"):
+        clean, errors = tray_ui_validate({"theme": theme})
+        assert not errors
+        kb.apply_settings(clean)
+        assert kb.current_settings()["theme"] == theme
+        assert kb.load_config()["theme"] == theme
+
+
+def test_popup_theme_overrides_system_without_recoloring_ring(cfg, monkeypatch):
+    panel = Mock(dark=False, dev=kb.KB)
+    monkeypatch.setattr(kb, "PANELS", [panel])
+    system_dark = Mock(return_value=False)
+    monkeypatch.setattr(kb, "taskbar_theme_dark", system_dark)
+
+    kb.apply_settings(values(theme="dark"), persist=False)
+    assert kb.ui_theme_dark() is True
+    panel.retint.assert_called_with(False)
+    panel.retint_tooltip.assert_called_with(True)
+
+    system_dark.return_value = True
+    kb.apply_settings(values(theme="light"), persist=False)
+    assert kb.ui_theme_dark() is False
+    panel.retint.assert_called_with(True)
+    panel.retint_tooltip.assert_called_with(False)
+
+    kb.apply_settings(values(theme="system"), persist=False)
+    assert kb.ui_theme_dark() is True
+    panel.retint_tooltip.assert_called_with(True)
+    system_dark.return_value = False
+    kb.check_theme()
+    assert kb.ui_theme_dark() is False
+    panel.retint_tooltip.assert_called_with(False)
+
+
 def test_setting_names_are_saved_with_the_form(cfg, tmp_path, monkeypatch):
     device = kb.Device("logitech_test_1", "鼠标")
     monkeypatch.setattr(kb, "CONFIG", str(tmp_path / "config.json"))
@@ -132,6 +174,47 @@ def test_failed_settings_write_preserves_previous_values(cfg, tmp_path, monkeypa
     with pytest.raises(OSError):
         kb.apply_settings(values(interval_sec=110, show={"device": False}))
     assert kb.current_settings() == before
+
+
+def test_migrate_legacy_preferences_once(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy.json"
+    config = tmp_path / "config.json"
+    legacy.write_text('{"interval_sec": 35, "device_name": "办公键盘", "show": {"mouse": false}}',
+                      encoding="utf-8")
+    monkeypatch.setattr(kb, "CONFIG", str(config))
+    monkeypatch.setattr(kb, "LEGACY_CONFIG", str(legacy))
+    monkeypatch.setattr(kb, "_DEFAULT_APPDIR", str(tmp_path / "roaming"))
+    monkeypatch.setattr(kb, "_PORTABLE_APPDIR", str(tmp_path / "portable"))
+    assert kb.migrate_legacy_config()
+    settings = kb.load_config()
+    assert settings["interval_sec"] == 35
+    assert settings["device_name"] == "办公键盘"
+    assert settings["show"] == {"device": True, "mouse": False}
+    legacy.write_text('{"interval_sec": 20}', encoding="utf-8")
+    assert not kb.migrate_legacy_config()
+    assert kb.load_config() == settings
+
+
+def test_malformed_config_does_not_break_polling_or_display(tmp_path, monkeypatch):
+    path = tmp_path / "config.json"
+    path.write_text('{"interval_sec": "abc", "low_threshold": 999, "show": null, '
+                    '"device_name": 123, "taskbar": null, "stale_hours": 1e308}',
+                    encoding="utf-8")
+    monkeypatch.setattr(kb, "CONFIG", str(path))
+    settings = kb.load_config()
+    assert settings["interval_sec"] == 60
+    assert settings["low_threshold"] == kb.LIMITS["threshold"][1]
+    assert settings["stale_min"] == kb.LIMITS["stale_min"][1]
+    assert settings["show"] == {"device": True, "mouse": True}
+    assert settings["device_name"] == "" and settings["taskbar"] is True
+
+
+def test_data_directory_falls_back_when_preferred_path_is_unusable(tmp_path):
+    unavailable = tmp_path / "unavailable"
+    unavailable.write_text("file", encoding="utf-8")
+    alternative = tmp_path / "local-data"
+    assert kb._data_directory(str(unavailable), str(alternative)) == str(alternative)
+    assert alternative.is_dir()
 
 
 def test_log_limits_reads_config(cfg):
@@ -240,6 +323,83 @@ def test_settings_window_expands_advanced_for_invalid_log_field():
         assert not label.winfo_ismapped()
         dialog.save()
         assert saved[0]["log_max_mb"] == 0.5
+    finally:
+        root.destroy()
+
+
+def test_theme_preview_preserves_edits_and_applies_only_on_save(cfg, tmp_path, monkeypatch):
+    try:
+        root = kb.tk.Tk()
+    except kb.tk.TclError:
+        pytest.skip("当前环境无法启动 Tk")
+    root.withdraw()
+    monkeypatch.setattr(kb, "ROOT", root)
+    monkeypatch.setattr(kb, "_SETTINGS", None)
+    monkeypatch.setattr(kb, "_OVERVIEW", None)
+    monkeypatch.setattr(kb, "CONFIG", str(tmp_path / "config.json"))
+    monkeypatch.setattr(kb, "taskbar_theme_dark", lambda: False)
+    mouse = kb.tray_ui.SettingsDeviceRow("mouse", "鼠标", "鼠标", 45, False, False)
+    monkeypatch.setattr(kb, "_device_rows", lambda: [mouse])
+    kb.CFG["theme"] = "system"
+    anchor = (100, 200, 124, 224)
+
+    try:
+        kb.open_overview(anchor)
+        assert not kb._OVERVIEW.palette.dark
+        kb.open_settings(anchor)
+        dialog = kb._SETTINGS
+        assert not dialog.palette.dark
+        assert set(dialog._theme_buttons) == {"system", "light", "dark"}
+        assert all(button.winfo_reqheight() >= dialog._px(40)
+                   for button in dialog._theme_buttons.values())
+        dialog.vars["interval"].set("47")
+        dialog._toggle_advanced()
+        dialog._set_field_error("threshold", "低电量阈值有误")
+        original_canvas = dialog.canvas
+        original_button = dialog._theme_buttons["dark"]
+        original_entry, _ = dialog._fields["interval"]
+        switch, _, preview = dialog._device_controls["mouse"]
+        previous_image = preview.cget("image")
+        original_entry.focus_force()
+        root.update_idletasks()
+        original_entry.selection_range(0, 1)
+        scroll = dialog.canvas.yview()
+        dialog._theme_buttons["dark"].invoke()
+        assert dialog.vars["theme"].get() == "dark"
+        root.update_idletasks()
+        assert dialog._theme_buttons["dark"] is original_button
+        assert dialog.canvas is original_canvas and dialog.canvas.yview() == scroll
+        assert dialog.win.focus_get() is original_entry and original_entry.selection_present()
+        assert dialog._device_controls["mouse"][0] is switch
+        assert preview.cget("image") != previous_image
+        assert switch.cget("bg") == dialog.palette.control
+        threshold, error = dialog._fields["threshold"]
+        assert error.winfo_manager() == "grid"
+        assert threshold.cget("highlightbackground") == error.cget("fg") == dialog.palette.error
+        assert dialog.palette.dark and dialog.body.cget("bg") == dialog.palette.card_bg
+        assert dialog.vars["interval"].get() == "47" and dialog._advanced_open
+        assert dialog._theme_buttons["dark"].cget("bg") == dialog.palette.control_focus
+        assert kb.current_settings()["theme"] == "system"
+        assert not (tmp_path / "config.json").exists()
+        dialog.reset()
+        assert dialog.vars["theme"].get() == "system"
+        assert not dialog.palette.dark
+        dialog._theme_buttons["dark"].invoke()
+        dialog.close()
+
+        kb.open_settings(anchor)
+        dialog = kb._SETTINGS
+        assert not dialog.palette.dark
+        assert dialog.vars["theme"].get() == "system"
+        dialog._theme_buttons["dark"].invoke()
+        dialog.save()
+        assert not dialog.alive()
+
+        kb.open_overview(anchor)
+        assert kb._OVERVIEW.palette.dark
+        kb.open_settings(anchor)
+        assert kb._SETTINGS.palette.dark
+        assert kb._SETTINGS.vars["theme"].get() == "dark"
     finally:
         root.destroy()
 

@@ -135,6 +135,8 @@ def battery_reading(dev, threshold=DEFAULT_LOW_THRESHOLD):
         return BatteryReading(None, "电量未知", status)
     if getattr(dev, "wired", False):
         return BatteryReading(None, "电量未知", "已接线")
+    if level is None and dev.charging:
+        return BatteryReading(None, "电量未知", "充电中")
     caption = "当前电量" if level is not None else "电量未知"
     status = status_label(level, dev.charging, status=dev.status) if level is not None else ""
     if is_low(level, dev.charging, threshold=threshold):
@@ -184,6 +186,10 @@ class Palette:
             return self.fg_dim
         color = level_color(level, charging, threshold=threshold)
         return color if self.dark else LIGHT_TEXT_COLOR[color]
+
+    @property
+    def error(self):
+        return self.reading_color(0, False, False, DEFAULT_LOW_THRESHOLD)
 
 
 # ---------------------------------------------------------------- 字体
@@ -280,7 +286,8 @@ def ring_image(size=RING_SIZE, level=None, charging=False, stale=False,
     alpha = max(0, min(255, int(alpha)))
     if disconnected:
         stale = True
-    key = (int(size), level, bool(charging), bool(stale), bool(dark), alpha,
+    key = (int(size), level, bool(charging), bool(stale),
+           palette.track, palette.bg, palette.fg, palette.fg_dim, alpha,
            stroke, bool(text), bool(disconnected), threshold)
     hit = _IMG_CACHE.get(key)
     if hit is not None:
@@ -683,11 +690,14 @@ def center_window(win, area):
     move_window(win, x, y)
 
 
+def _popup_above(anchor, area):
+    return anchor[1] - area[1] >= area[3] - anchor[3]
+
+
 def popup_position(anchor, area, width, height):
     left, top, right, bottom = area
     anchor_left, anchor_top, anchor_right, anchor_bottom = anchor
-    above, below = anchor_top - top, bottom - anchor_bottom
-    y = anchor_top - height - PAD_MD if above >= below else anchor_bottom + PAD_MD
+    y = anchor_top - height - PAD_MD if _popup_above(anchor, area) else anchor_bottom + PAD_MD
     x = anchor_right - width if anchor_right - left >= right - anchor_left else anchor_left
     return (max(left, min(right - width, x)), max(top, min(bottom - height, y)))
 
@@ -715,6 +725,12 @@ class _PanelControls:
     def _font(self, size, bold=False, family=FONT_FAMILY):
         return family, -self._px(size), "bold" if bold else "normal"
 
+    def _theme_widget(self, widget, **colors):
+        widget.configure(**{option: (widget.master.cget("bg") if role == "parent"
+                                     else getattr(self.palette, role))
+                            for option, role in colors.items()})
+        return widget
+
     def _scrollbar_style(self, frame):
         p = self.palette
         style = ttk.Style(frame)
@@ -734,35 +750,32 @@ class _PanelControls:
         return name
 
     def _button(self, parent, text, command, *, primary=False):
-        p = self.palette
-        bg = p.control_focus if primary else p.control
-        fg = p.card_bg if primary else p.fg
-        hover = p.primary_hover if primary else p.control_hover
-        button = tk.Button(parent, text=text, command=command,
-                           font=self._font(13), bg=bg, fg=fg,
-                           activebackground=hover, activeforeground=fg,
-                           disabledforeground=p.fg_dim, relief="flat", bd=0,
-                           highlightthickness=self._px(1), highlightbackground=parent.cget("bg"),
-                           highlightcolor=p.control_focus, takefocus=True,
+        bg = "control_focus" if primary else "control"
+        fg = "card_bg" if primary else "fg"
+        button = tk.Button(parent, text=text, command=command, font=self._font(13),
+                           relief="flat", bd=0, highlightthickness=self._px(1), takefocus=True,
                            padx=self._px(PAD_MD), pady=self._px(PAD_SM))
-        button.bind("<Enter>", lambda _: button.configure(bg=hover)
+        self._theme_widget(button, bg=bg, fg=fg,
+                           activebackground="primary_hover" if primary else "control_hover",
+                           activeforeground=fg, disabledforeground="fg_dim",
+                           highlightbackground="parent", highlightcolor="control_focus")
+        button.bind("<Enter>", lambda _: button.configure(bg=button.cget("activebackground"))
                     if button.cget("state") != "disabled" else None)
-        button.bind("<Leave>", lambda _: button.configure(bg=bg))
+        button.bind("<Leave>", lambda _: button.configure(bg=getattr(self.palette, bg)))
         button.bind("<Return>", lambda _: self._invoke(button))
         return button
 
     def _switch(self, parent, text, selected, command=None, textvariable=None):
-        p = self.palette
         switch = tk.Checkbutton(parent, text=text, textvariable=textvariable,
                                 variable=selected, command=command,
                                 indicatoron=False, image=self._switch_off,
                                 selectimage=self._switch_on, compound="right",
-                                font=self._font(13), bg=p.control, fg=p.fg,
-                                activebackground=p.control_hover, activeforeground=p.fg,
-                                selectcolor=p.selection, relief="flat", offrelief="flat",
+                                font=self._font(13), relief="flat", offrelief="flat",
                                 bd=0, highlightthickness=self._px(1), takefocus=True,
-                                highlightbackground=p.bg, highlightcolor=p.control_focus,
                                 padx=self._px(PAD_MD), pady=self._px(PAD_MD), cursor="hand2")
+        self._theme_widget(switch, bg="control", fg="fg", activebackground="control_hover",
+                           activeforeground="fg", selectcolor="selection",
+                           highlightbackground="parent", highlightcolor="control_focus")
         switch.bind("<Return>", lambda _: self._invoke(switch))
         return switch
 
@@ -812,7 +825,7 @@ class DeviceOverview(_PanelControls):
     """共用的电量面板，贴近图标，失去焦点即收起。"""
 
     def __init__(self, root, *, palette, dpi, on_refresh, on_settings, on_toggle_ring,
-                 on_taskbar, on_autostart, on_log, on_quit):
+                 on_taskbar, on_autostart, on_log, on_quit, on_update=None):
         self.palette = p = palette
         self.dpi = dpi
         self.win = tk.Toplevel(root)
@@ -825,6 +838,7 @@ class DeviceOverview(_PanelControls):
         self.win.bind("<FocusOut>", self._focus_out)
         self.win.bind("<MouseWheel>", self._scroll)
         self._anchor = None
+        self._area = None
         self._selected = None
         self._rows = None
         self._refresh = None
@@ -868,9 +882,10 @@ class DeviceOverview(_PanelControls):
         tk.Frame(body, bg=p.sep, height=1).pack(fill="x")
         footer = tk.Frame(body, bg=p.bg, padx=self._px(PAD_XL), pady=self._px(PAD_MD))
         footer.pack(fill="x")
-        actions = tk.Frame(footer, bg=p.bg)
+        actions = self._actions = tk.Frame(footer, bg=p.bg)
         actions.pack(fill="x")
         self.more = self._button(actions, "更多操作", self._toggle_options)
+        self.more.configure(width=10)
         self.more.pack(side="left")
         settings_button = self._button(actions, "设置…", lambda: self._open_settings(on_settings))
         self.quit_button = self._button(actions, "退出程序", on_quit)
@@ -890,8 +905,11 @@ class DeviceOverview(_PanelControls):
             row=0, column=0, sticky="ew", padx=(0, gap))
         self._switch(switches, "开机自启", self._autostart, on_autostart).grid(
             row=0, column=1, sticky="ew", padx=(gap, 0))
-        self._button(self._options, "打开日志", on_log).pack(
-            anchor="w", pady=(self._px(PAD_SM), 0))
+        tools = tk.Frame(self._options, bg=p.bg)
+        tools.pack(fill="x", pady=(self._px(PAD_SM), 0))
+        self._button(tools, "打开日志", on_log).pack(side="left")
+        if on_update is not None:
+            self._button(tools, "检查更新", on_update).pack(side="right")
 
     def update_options(self, taskbar, autostart):
         self._taskbar.set(taskbar)
@@ -900,7 +918,11 @@ class DeviceOverview(_PanelControls):
     def _toggle_options(self):
         expanded = not self._options.winfo_manager()
         if expanded:
-            self._options.pack(fill="x", pady=(self._px(PAD_MD), 0))
+            gap = self._px(PAD_MD)
+            if _popup_above(self._anchor, self._area):
+                self._options.pack(fill="x", before=self._actions, pady=(0, gap))
+            else:
+                self._options.pack(fill="x", after=self._actions, pady=(gap, 0))
         else:
             self._options.pack_forget()
         self.more.configure(text="收起操作" if expanded else "更多操作")
@@ -1000,10 +1022,14 @@ class DeviceOverview(_PanelControls):
         natural = self.list.winfo_reqheight()
         cap = self._px(304)
         if self._anchor is not None:
-            area = _monitor_work_area(*anchor_center(self._anchor))
-            if area is not None:
-                chrome = self.win.winfo_reqheight() - self.canvas.winfo_reqheight()
-                cap = min(cap, max(self._px(50), area[3] - area[1] - chrome - self._px(PAD_XL)))
+            above = _popup_above(self._anchor, self._area)
+            available = (self._anchor[1] - self._area[1] if above
+                         else self._area[3] - self._anchor[3])
+            chrome = self.win.winfo_reqheight() - self.canvas.winfo_reqheight()
+            if not above and not self._options.winfo_manager():
+                # 下方展开时预留操作区高度，设备列表就不会把按钮往上推。
+                chrome += self._options.winfo_reqheight() + self._px(PAD_MD)
+            cap = min(cap, max(self._px(50), available - chrome - PAD_MD))
         clipped = natural > cap
         if clipped:
             self.scrollbar.pack(side="right", fill="y", before=self.canvas)
@@ -1019,6 +1045,8 @@ class DeviceOverview(_PanelControls):
 
     def show(self, anchor, selected, rows, refresh, threshold):
         self._anchor = anchor
+        self._area = (_monitor_work_area(*anchor_center(anchor))
+                      or (0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight()))
         if selected != self._selected:
             self._selected = selected
             self._rows = None
@@ -1059,9 +1087,21 @@ class DeviceOverview(_PanelControls):
 
 # ---------------------------------------------------------------- 设置面板
 
+DEFAULT_THEME = "system"
+THEME_OPTIONS = {
+    DEFAULT_THEME: "跟随 Windows",
+    "light": "浅色",
+    "dark": "深色",
+}
+
+
+def normalize_theme(value):
+    return value if isinstance(value, str) and value in THEME_OPTIONS else DEFAULT_THEME
+
+
 FORM_DEFAULTS = {
     "interval": "60",
-    "threshold": "20",
+    "threshold": str(DEFAULT_LOW_THRESHOLD),
     "stale_min": "2",
     "log_max_mb": "1",
     "log_keep": "3",
@@ -1107,6 +1147,8 @@ def _validate_fields(raw, limits=None):
             v = max(lo, min(hi, v))
         out[setting] = v
     out["log_max_mb"] = round(out["log_max_mb"], 2)
+    if "theme" in raw:
+        out["theme"] = normalize_theme(raw["theme"])
     show = raw.get("show") or {}
     out["show"] = {"device": True, "mouse": True}
     out["show"].update({key: bool(value) for key, value in show.items()})
@@ -1132,17 +1174,20 @@ class SettingsDeviceRow(NamedTuple):
 class SettingsDialog(_PanelControls):
     """可保存或取消的设置面板，使用与电量面板相同的控件。"""
 
-    def __init__(self, root, values, devices, on_save, palette=None, anchor=None):
+    def __init__(self, root, values, devices, on_save, palette=None, anchor=None, *,
+                 system_theme_dark=None):
         self.on_save = on_save
-        self.palette = p = palette or Palette()
+        self.palette = palette or Palette()
+        initial_dark = self.palette.dark
+        self._system_theme_dark = system_theme_dark or (lambda: initial_dark)
         self._anchor = anchor
         self._preview_threshold = values["low_threshold"]
-        self._preview_imgs = []
         self._fields = {}
         self._field_errors = {}
         self._device_names = {}
         self._device_controls = {}
         self._devices = None
+        self._advanced_open = False
 
         self._area, dpi = monitor_at(*anchor_center(anchor)) if anchor is not None else cursor_monitor()
         self.dpi = dpi or round(root.winfo_fpixels("1i"))
@@ -1152,43 +1197,79 @@ class SettingsDialog(_PanelControls):
         win.overrideredirect(True)
         win.title("设置")
         win.attributes("-topmost", True)
-        win.configure(bg=p.card_border)
         win.protocol("WM_DELETE_WINDOW", self.close)
-
-        surface = tk.Frame(win, bg=p.card_bg)
-        surface.pack(fill="both", expand=True, padx=1, pady=1)
-        self._label(surface, "设置", size=18, bold=True).pack(
-            fill="x", padx=self._px(PAD_XL), pady=self._px(PAD_LG))
-
-        frame = tk.Frame(surface, bg=p.card_bg)
-        frame.pack(fill="both", expand=True)
-        self.canvas = tk.Canvas(frame, width=self._width, height=1, bg=p.card_bg,
-                                highlightthickness=0, takefocus=False)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview,
-                                       style=self._scrollbar_style(frame))
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.body = body = tk.Frame(self.canvas, bg=p.card_bg, padx=self._px(PAD_XL),
-                                   pady=self._px(PAD_MD))
-        body.columnconfigure(0, weight=1)
-        content = self.canvas.create_window((0, 0), window=body, anchor="nw", width=self._width)
-        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(content, width=e.width))
-        body.bind("<Configure>", lambda _: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
 
         self.vars = {
             field: tk.StringVar(master=win, value=_fmt(cast(values.get(setting, FORM_DEFAULTS[field])), cast))
             for field, (setting, _, _, cast) in FORM_FIELDS.items()
         }
+        self.vars["theme"] = tk.StringVar(master=win, value=normalize_theme(values.get("theme")))
         self.vars["show"] = {}
+        self.log_hint = tk.StringVar(master=win)
+        self.error = tk.StringVar(master=win)
+        self._device_font = tkfont.Font(root=win, font=self._font(13))
+        self._build(devices, values["show"])
+
+        for field in FORM_FIELDS:
+            self.vars[field].trace_add("write", lambda *_, key=field: self._field_changed(key))
+        self._refresh_hint()
+
+        win.bind("<Return>", lambda _: self.save())
+        win.bind("<Escape>", lambda _: self.close())
+        win.bind("<Alt-F4>", lambda _: self.close())
+        win.bind("<MouseWheel>", self._scroll)
+        win.bind("<FocusIn>", self._keep_focused_visible)
+
+    def _build(self, devices, show):
+        win = self._theme_widget(self.win, bg="card_border")
+        surface = self._theme_widget(tk.Frame(win), bg="card_bg")
+        surface.pack(fill="both", expand=True, padx=1, pady=1)
+        self._label(surface, "设置", size=18, bold=True).pack(
+            fill="x", padx=self._px(PAD_XL), pady=self._px(PAD_LG))
+
+        frame = self._theme_widget(tk.Frame(surface), bg="card_bg")
+        frame.pack(fill="both", expand=True)
+        self.canvas = self._theme_widget(
+            tk.Canvas(frame, width=self._width, height=1, highlightthickness=0, takefocus=False),
+            bg="card_bg")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.canvas.yview,
+                                       style=self._scrollbar_style(frame))
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.body = body = self._theme_widget(
+            tk.Frame(self.canvas, padx=self._px(PAD_XL), pady=self._px(PAD_MD)), bg="card_bg")
+        body.columnconfigure(0, weight=1)
+        content = self.canvas.create_window((0, 0), window=body, anchor="nw", width=self._width)
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(content, width=e.width))
+        body.bind("<Configure>", lambda _: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
         self._switch_off = self._switch_image(False)
         self._switch_on = self._switch_image(True)
-        self._device_font = tkfont.Font(root=win, font=self._font(13))
 
-        row = self._section(body, 0, "任务栏圆环")
-        self.device_list = tk.Frame(body, bg=p.card_bg)
+        row = self._section(body, 0, "外观")
+        choices = self._theme_widget(tk.Frame(body), bg="card_bg")
+        choices.grid(row=row, column=0, columnspan=3, sticky="ew")
+        choices.columnconfigure((0, 1, 2), weight=1, uniform="themes")
+        self._theme_buttons = {}
+        for column, (theme, label) in enumerate(THEME_OPTIONS.items()):
+            option = tk.Radiobutton(
+                choices, text=label, variable=self.vars["theme"], value=theme,
+                command=self._preview_theme, indicatoron=False, relief="flat", offrelief="flat",
+                font=self._font(13, bold=True), bd=0, takefocus=True,
+                highlightthickness=self._px(1), padx=self._px(PAD_SM),
+                pady=self._px(PAD_LG + PAD_XS))
+            self._theme_widget(option, selectcolor="control_focus",
+                               highlightbackground="parent", highlightcolor="control_focus")
+            option.grid(row=0, column=column, sticky="ew",
+                        padx=(self._px(PAD_SM) if column else 0, 0))
+            option.bind("<Return>", lambda event: self._invoke(event.widget))
+            self._theme_buttons[theme] = option
+        self._style_theme_buttons()
+
+        row = self._section(body, row + 1, "任务栏圆环")
+        self.device_list = self._theme_widget(tk.Frame(body), bg="card_bg")
         self.device_list.grid(row=row, column=0, columnspan=3, sticky="ew")
         self.device_list.columnconfigure(0, weight=1)
-        self.update_devices(devices, values["show"])
         row = self._number_row(body, row + 1, "stale_min", "分钟")
         self._label(body, "设为 0 分钟会在断开后立即隐藏圆环", muted=True).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, self._px(PAD_SM)))
@@ -1202,51 +1283,80 @@ class SettingsDialog(_PanelControls):
         self.advanced_button = self._button(body, "高级日志设置", self._toggle_advanced)
         self.advanced_button.grid(row=row + 1, column=0, columnspan=3, sticky="w",
                                   pady=(self._px(PAD_XL), self._px(PAD_SM)))
-        self.advanced = tk.Frame(body, bg=p.card_bg)
+        self.advanced = self._theme_widget(tk.Frame(body), bg="card_bg")
         self.advanced.grid(row=row + 2, column=0, columnspan=3, sticky="ew")
         self.advanced.columnconfigure(0, weight=1)
         advanced_row = self._number_row(self.advanced, 0, "log_max_mb", "MB")
         advanced_row = self._number_row(self.advanced, advanced_row, "log_keep", "份")
         advanced_row = self._number_row(self.advanced, advanced_row, "log_retention_days", "天")
-        self.log_hint = tk.StringVar(master=win)
         self._label(self.advanced, muted=True, textvariable=self.log_hint).grid(
             row=advanced_row, column=0, columnspan=3, sticky="w")
-        self._show_advanced(False)
+        self._show_advanced(self._advanced_open)
 
-        tk.Frame(surface, bg=p.sep, height=1).pack(fill="x")
-        footer = tk.Frame(surface, bg=p.bg, padx=self._px(PAD_XL), pady=self._px(PAD_MD))
+        self._theme_widget(tk.Frame(surface, height=1), bg="sep").pack(fill="x")
+        footer = self._theme_widget(
+            tk.Frame(surface, padx=self._px(PAD_XL), pady=self._px(PAD_MD)), bg="bg")
         footer.pack(fill="x")
-        self.error = tk.StringVar(master=win)
         self.error_label = self._label(footer, textvariable=self.error, error=True,
                                        wraplength=self._width - self._px(2 * PAD_XL))
-        buttons = self._footer_buttons = tk.Frame(footer, bg=p.bg)
+        buttons = self._footer_buttons = self._theme_widget(tk.Frame(footer), bg="bg")
         buttons.pack(fill="x")
         self._button(buttons, "恢复默认", self.reset).pack(side="left")
         cancel = self._button(buttons, "取消", self.close)
         self._button(buttons, "保存", self.save, primary=True).pack(side="right")
         cancel.pack(side="right", padx=(0, self._px(PAD_MD)))
 
-        for field in FORM_FIELDS:
-            self.vars[field].trace_add("write", lambda *_, key=field: self._field_changed(key))
-        self._refresh_hint()
+        self.update_devices(devices, show)
 
-        win.bind("<Return>", lambda _: self.save())
-        win.bind("<Escape>", lambda _: self.close())
-        win.bind("<Alt-F4>", lambda _: self.close())
-        win.bind("<MouseWheel>", self._scroll)
-        win.bind("<FocusIn>", self._keep_focused_visible)
+    def _theme_widget(self, widget, **colors):
+        widget._palette_roles = colors
+        return super()._theme_widget(widget, **colors)
+
+    def _refresh_widget_colors(self, widget):
+        colors = getattr(widget, "_palette_roles", None)
+        if colors:
+            super()._theme_widget(widget, **colors)
+        for child in widget.winfo_children():
+            self._refresh_widget_colors(child)
+
+    def _style_theme_buttons(self):
+        p = self.palette
+        theme = self.vars["theme"].get()
+        for value, option in self._theme_buttons.items():
+            selected = value == theme
+            fg = p.card_bg if selected else p.fg
+            option.configure(bg=p.control_focus if selected else p.control, fg=fg,
+                             activebackground=p.primary_hover if selected else p.control_hover,
+                             activeforeground=fg)
+
+    def _preview_theme(self):
+        theme = self.vars["theme"].get()
+        dark = self._system_theme_dark() if theme == DEFAULT_THEME else theme == "dark"
+        if dark != self.palette.dark:
+            self.palette = Palette(dark)
+            self._refresh_widget_colors(self.win)
+            self.scrollbar.configure(style=self._scrollbar_style(self.scrollbar.master))
+            for field in self._fields:
+                self._style_field_border(field)
+
+            switch_off = self._switch_image(False)
+            switch_on = self._switch_image(True)
+            for device in self._devices or ():
+                switch, _, preview = self._device_controls[device.key]
+                switch.configure(image=switch_off, selectimage=switch_on)
+                self._render_ring_preview(preview, device)
+            self._switch_off, self._switch_on = switch_off, switch_on
+        self._style_theme_buttons()
 
     def _label(self, parent, text="", *, size=13, bold=False, muted=False, error=False, **kwargs):
-        p = self.palette
-        color = p.reading_color(0, False, False, DEFAULT_LOW_THRESHOLD) if error else (
-            p.fg_dim if muted else p.fg)
-        return tk.Label(parent, text=text, bg=parent.cget("bg"), fg=color,
+        label = tk.Label(parent, text=text,
                         font=self._font(12 if muted or error else size, bold), anchor="w",
                         justify="left", padx=0, pady=0, **kwargs)
+        return self._theme_widget(label, bg="parent", fg="error" if error else ("fg_dim" if muted else "fg"))
 
     def _section(self, parent, row, text):
         if row:
-            tk.Frame(parent, bg=self.palette.sep, height=1).grid(
+            self._theme_widget(tk.Frame(parent, height=1), bg="sep").grid(
                 row=row, column=0, columnspan=3, sticky="ew",
                 pady=(self._px(PAD_LG), self._px(PAD_LG)))
             row += 1
@@ -1255,7 +1365,6 @@ class SettingsDialog(_PanelControls):
         return row + 1
 
     def _number_row(self, parent, row, field, unit):
-        p = self.palette
         _, limit_key, label, cast = FORM_FIELDS[field]
         lo, hi, step = LIMITS[limit_key]
         self._label(parent, label).grid(row=row, column=0, sticky="w", pady=self._px(PAD_XS))
@@ -1263,10 +1372,9 @@ class SettingsDialog(_PanelControls):
                            textvariable=self.vars[field],
                            format="%.2f" if cast is float else "%.0f", justify="left",
                            font=self._font(14, family=FONT_NUM), relief="flat", bd=0,
-                           bg=p.bg, fg=p.fg, insertbackground=p.fg, buttonbackground=p.control,
-                           selectbackground=p.control_focus, selectforeground=p.card_bg,
-                           highlightthickness=self._px(1), highlightbackground=p.card_border,
-                           highlightcolor=p.control_focus)
+                           highlightthickness=self._px(1))
+        self._theme_widget(entry, bg="bg", fg="fg", insertbackground="fg", buttonbackground="control",
+                           selectbackground="control_focus", selectforeground="card_bg")
         entry.grid(row=row, column=1, sticky="e", ipady=self._px(PAD_XS),
                    padx=(self._px(PAD_LG), self._px(PAD_MD)), pady=self._px(PAD_SM))
         entry.bind("<MouseWheel>", self._scroll)
@@ -1275,11 +1383,20 @@ class SettingsDialog(_PanelControls):
         error.grid(row=row + 1, column=0, columnspan=3, sticky="w", pady=(0, self._px(PAD_SM)))
         error.grid_remove()
         self._fields[field] = (entry, error)
+        self._style_field_border(field)
         return row + 2
 
     def update_devices(self, devices, show):
         if devices == self._devices or self.win.grab_current() not in (None, self.win):
             return
+        if self._devices is not None:
+            identity = lambda device: (device.key, device.name, device.automatic_name)
+            if tuple(map(identity, devices)) == tuple(map(identity, self._devices)):
+                for before, device in zip(self._devices, devices):
+                    if before != device:
+                        self._render_ring_preview(self._device_controls[device.key][2], device)
+                self._devices = devices
+                return
         layout_changed = self._devices is None or len(devices) != len(self._devices)
         self._devices = devices
         focused = self.win.focus_get()
@@ -1288,7 +1405,6 @@ class SettingsDialog(_PanelControls):
         self._device_controls.clear()
         for widget in self.device_list.winfo_children():
             widget.destroy()
-        self._preview_imgs.clear()
         if not devices:
             self._label(self.device_list, "未检测到设备", muted=True).grid(
                 row=0, column=0, sticky="w", pady=self._px(PAD_SM))
@@ -1305,25 +1421,30 @@ class SettingsDialog(_PanelControls):
                 self._device_controls[key][index].focus_set()
 
     def _device_row(self, row, device):
-        p = self.palette
-        key, name, automatic_name, level, charging, stale = device
-        frame = tk.Frame(self.device_list, bg=p.card_bg)
+        key = device.key
+        frame = self._theme_widget(tk.Frame(self.device_list), bg="card_bg")
         frame.grid(row=row, column=0, sticky="ew", pady=self._px(PAD_XS))
         frame.columnconfigure(1, weight=1)
-        image = ring_image(self._px(36), level, charging, stale, dark=p.dark,
-                           palette=p, stroke=self._px(3), threshold=self._preview_threshold)
-        photo = ImageTk.PhotoImage(image, master=self.win)
-        self._preview_imgs.append(photo)
-        self._label(frame, image=photo).grid(row=0, column=0, padx=(0, self._px(PAD_SM)))
+        preview = self._label(frame)
+        self._render_ring_preview(preview, device)
+        preview.grid(row=0, column=0, padx=(0, self._px(PAD_SM)))
         label = tk.StringVar(master=self.win)
-        self._set_device_label(label, self._device_names.get(key, name) or automatic_name)
+        self._set_device_label(label, self._device_names.get(key, device.name) or device.automatic_name)
         switch = self._switch(frame, "", self.vars["show"][key], textvariable=label)
-        switch.configure(anchor="w", highlightbackground=p.card_bg)
+        switch.configure(anchor="w")
         switch.grid(row=0, column=1, sticky="ew")
         rename = self._button(frame, "重命名",
-                              lambda: self._rename_device(key, name, automatic_name, label))
+                              lambda: self._rename_device(key, device.name, device.automatic_name, label))
         rename.grid(row=0, column=2, sticky="e", padx=(self._px(PAD_MD), 0))
-        self._device_controls[key] = (switch, rename)
+        self._device_controls[key] = (switch, rename, preview)
+
+    def _render_ring_preview(self, preview, device):
+        p = self.palette
+        image = ring_image(self._px(36), device.level, device.charging, device.stale, dark=p.dark,
+                           palette=p, stroke=self._px(3), threshold=self._preview_threshold)
+        photo = ImageTk.PhotoImage(image, master=self.win)
+        preview.configure(image=photo)
+        preview.image = photo
 
     def _set_device_label(self, label, name):
         label.set(self._fit_text(name, self._device_font, self._width - self._px(218)))
@@ -1341,6 +1462,7 @@ class SettingsDialog(_PanelControls):
 
     def _raw(self):
         raw = {key: self.vars[key].get() for key in FORM_FIELDS}
+        raw["theme"] = self.vars["theme"].get()
         raw["show"] = {key: var.get() for key, var in self.vars["show"].items()}
         return raw
 
@@ -1357,10 +1479,12 @@ class SettingsDialog(_PanelControls):
     def reset(self):
         for field, value in FORM_DEFAULTS.items():
             self.vars[field].set(value)
+        self.vars["theme"].set(DEFAULT_THEME)
         for var in self.vars["show"].values():
             var.set(True)
         self.error.set("")
         self.error_label.pack_forget()
+        self._preview_theme()
         self._reposition()
 
     def _show_advanced(self, show):
@@ -1377,18 +1501,22 @@ class SettingsDialog(_PanelControls):
         return "break"
 
     def _set_field_error(self, field, message):
-        entry, label = self._fields[field]
+        _, label = self._fields[field]
         if message:
             self._field_errors[field] = message
             label.configure(text=message)
             label.grid()
-            color = label.cget("fg")
-            entry.configure(highlightbackground=color, highlightcolor=color)
         else:
             self._field_errors.pop(field, None)
             label.grid_remove()
-            entry.configure(highlightbackground=self.palette.card_border,
-                            highlightcolor=self.palette.control_focus)
+        self._style_field_border(field)
+
+    def _style_field_border(self, field):
+        entry, _ = self._fields[field]
+        p = self.palette
+        invalid = field in self._field_errors
+        entry.configure(highlightbackground=p.error if invalid else p.card_border,
+                        highlightcolor=p.error if invalid else p.control_focus)
 
     def _field_changed(self, field):
         if field in self._field_errors:
@@ -1483,7 +1611,6 @@ class SettingsDialog(_PanelControls):
         self.win.grab_set()
 
     def close(self):
-        self._preview_imgs.clear()
         try:
             self.win.grab_release()
         except Exception:

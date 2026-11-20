@@ -1,0 +1,79 @@
+name: Test and package Windows builds
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r python/requirements-test.txt
+      - run: python -B -m pytest -q python/tests
+      - name: Build Python update
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: python -B python/app_update.py --build "$GITHUB_REF_NAME" python/dist/peripheral-battery-tray-update.zip
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: python-update
+          path: python/dist/peripheral-battery-tray-update.zip
+          if-no-files-found: error
+
+  native:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM-MinGW
+        shell: pwsh
+        run: |
+          $tool = 'llvm-mingw-20261117-ucrt-x86_64'
+          $zip = Join-Path $env:RUNNER_TEMP "$tool.zip"
+          Invoke-WebRequest "https://github.com/mstorsjo/llvm-mingw/releases/download/20261117/$tool.zip" -OutFile $zip
+          if ((Get-FileHash -LiteralPath $zip).Hash -ne '4d002e330a0f703625aa5ccbc37e96f8f824413e163bfc7336774aabd2c3a412') {
+            throw 'Toolchain checksum mismatch'
+          }
+          Expand-Archive -LiteralPath $zip -DestinationPath $env:RUNNER_TEMP
+          "PBT_COMPILER=$(Join-Path $env:RUNNER_TEMP "$tool/bin/x86_64-w64-mingw32-clang++.exe")" >> $env:GITHUB_ENV
+      - name: Build and test native version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -like 'refs/tags/native-v*') {
+            $version = [regex]::Match((Get-Content native/update.hpp -Raw), 'version = L"([0-9.]+)"').Groups[1].Value
+            if ($env:GITHUB_REF_NAME -ne "native-v$version") { throw 'Native tag must match the source version.' }
+          }
+          ./native/build.ps1 -Compiler $env:PBT_COMPILER -Test
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/native-v')
+        with:
+          name: native-release
+          path: |
+            native/dist/peripheral-battery-tray-native.exe
+            native/dist/PicoJSON-LICENSE.txt
+          if-no-files-found: error
+
+  release:
+    needs: [python, native]
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/native-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+      - name: Publish matching release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$GITHUB_REF_NAME" in
+            native-v*) gh release create "$GITHUB_REF_NAME" dist/native-release/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --prerelease ;;
+            v*) gh release create "$GITHUB_REF_NAME" dist/python-update/* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes ;;
+          esac

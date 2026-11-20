@@ -38,7 +38,9 @@ def parse_compx_battery(frame):
         raise ValueError("未知供电状态 %#04x" % state)
     if state == STATE_CABLE:
         return 100, state          # 有线模式下接收器固定报 100
-    if not 1 <= level <= 100:
+    if level == 0:
+        raise ValueError("设备未上报电量")
+    if level > 100:
         raise ValueError("电量越界: %d" % level)
     return level, state
 
@@ -62,3 +64,28 @@ def parse_hidpp_battery(frame, dev=None):
     if level > 100:
         raise ValueError("电量越界: %d" % level)
     return level, status
+
+
+def parse_hidpp_unified_battery(frame):
+    """HID++ 0x1004 fn1 的百分比及充电状态，调用方先确认设备提供百分比。"""
+    if len(frame) < 8 or frame[0] != 0x11 or frame[4] > 100:
+        raise ValueError("无效的 HID++ 统一电量应答")
+    # 统一电量的 2、4 分别是慢速充电、充电错误。
+    return frame[4], (0, 1, 4, 3, 5)[min(frame[6], 4)]
+
+
+def parse_rapoo_vt_battery(frame, report_length):
+    """雷柏 VT 接收器主动上报的百分比和充电状态。"""
+    if len(frame) != report_length:
+        return None
+    if report_length == 7 and frame[:2] == b"\xbb\xb0":
+        state, level = frame[5:7]
+        if state == 2 and level == 0x7F:
+            return None, True
+    elif report_length in (13, 16, 19) and frame[0] == 0x07 and frame[1] & 0x0F == 0:
+        state, level = frame[7:9]
+    else:
+        return None
+    if state in (1, 2) and level <= 100:
+        return level, state == 2
+    return None

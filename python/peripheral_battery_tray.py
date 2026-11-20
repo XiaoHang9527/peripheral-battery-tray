@@ -10,7 +10,9 @@ import ctypes
 import ctypes.wintypes as wt
 import collections
 import hashlib
+from importlib.metadata import PackageNotFoundError, version as package_version
 import json
+import logging
 import os
 import sys
 import threading
@@ -18,39 +20,89 @@ import time
 import traceback
 import winreg
 
+APP_NAME = "PeripheralBatteryTray"
+INSTANCE_MUTEX = "Local\\" + APP_NAME
+DISPLAY_NAME = "外设电量"
+
+if __name__ == "__main__":
+    from pathlib import Path
+    from app_update import recover_before_import
+
+    try:
+        recover_before_import(Path(__file__).resolve().parent, INSTANCE_MUTEX)
+    except (OSError, ValueError, KeyError) as exc:
+        ctypes.windll.user32.MessageBoxW(None, str(exc), "外设电量更新恢复失败", 0x10)
+        sys.exit(1)
+
 import pystray
+try:
+    from pystray._util import win32 as tray_win32
+except ImportError:
+    tray_win32 = None
 
 from battery_protocols import (BATTERY_STATUS, CMD_BAT, CMD_MODEL, MODEL_NAMES,
                      REPORT_ID, REPORT_LEN, STATE_CABLE,
                      checksum, is_reply, parse_compx_battery,
-                     parse_compx_model, parse_hidpp_battery)
+                     parse_compx_model, parse_hidpp_battery,
+                     parse_hidpp_unified_battery, parse_rapoo_vt_battery)
 import tkinter as tk
 from PIL import ImageTk
 
 import tray_ui
+import vendor_battery
 from tray_ui import LIMITS, RING_WINDOW
-
-APP_NAME = "PeripheralBatteryTray"
-DISPLAY_NAME = "外设电量"
 
 # --- Compx 2.4G 接收器（协议常量与解析在 battery_protocols）
 VID, PID = 0x3554, 0xFA09
+COMPX_RECEIVERS = {(VID, PID), (VID, 0xFB40)}
 
 # --- Logitech Unifying / HID++
 LOGITECH_VID = 0x046D
 HIDPP_BATTERY = 0x1000
+HIDPP_UNIFIED_BATTERY = 0x1004
 HIDPP_NAME = 0x0005
 
-APPDIR = os.path.join(os.environ["APPDATA"], APP_NAME)
-LOCALDIR = os.path.join(os.environ["LOCALAPPDATA"], APP_NAME)
+# 仅匹配有电量报文资料的 2.4G 接收器。
+RAPOO_VT_RECEIVERS = {
+    0x1215: ("Rapoo VT3 Pro", (7,)),
+    0x1233: ("Rapoo VT1 Pro Max", (7,)),
+    0x1410: ("Rapoo VT0", (13, 16, 19)),
+    0x1414: ("Rapoo VT9（第二代）", (13, 16, 19)),
+    0x1417: ("Rapoo VT3 Max（第二代）", (13, 16, 19)),
+}
+
+def _data_directory(preferred, fallback):
+    """Windows 用户目录不可写时，将应用数据保存在项目本地。"""
+    if not preferred:
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+    try:
+        os.makedirs(preferred, exist_ok=True)
+        probe = os.path.join(preferred, f".write-test-{os.getpid()}-{time.time_ns()}")
+        with open(probe, "x", encoding="utf-8"):
+            pass
+        os.unlink(probe)
+        return preferred
+    except OSError:
+        os.makedirs(fallback, exist_ok=True)
+        return fallback
+
+
+_PORTABLE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".data")
+_ROAMING = os.environ.get("APPDATA")
+_LOCAL = os.environ.get("LOCALAPPDATA")
+_DEFAULT_APPDIR = os.path.join(_ROAMING, APP_NAME) if _ROAMING else None
+_PORTABLE_APPDIR = os.path.join(_PORTABLE, "config", APP_NAME)
+APPDIR = _data_directory(_DEFAULT_APPDIR, _PORTABLE_APPDIR)
+LOCALDIR = _data_directory(os.path.join(_LOCAL, APP_NAME) if _LOCAL else None,
+                           os.path.join(_PORTABLE, "runtime", APP_NAME))
 CONFIG = os.path.join(APPDIR, "config.json")
+LEGACY_CONFIG = os.path.join(_ROAMING, "KBBattery", "config.json") if _ROAMING else None
 LOG = os.path.join(LOCALDIR, "tray.log")
 LAST = os.path.join(LOCALDIR, "last.json")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-os.makedirs(APPDIR, exist_ok=True)
-
-from hid_transport import GUID, close_all, enum_hid, get_link, hid_path, k32
+from hid_transport import GUID, close_all, enum_hid, get_link, hid_path, k32, read_input_report
 
 u32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -69,14 +121,14 @@ _log_lock = threading.Lock()
 _config_lock = threading.Lock()
 
 MB_KB = 1024                  # 1 MB 记作 1024 KB
-LOG_MAX_MB = 1.0              # 单份上限默认 1 MB（范围见 tray_ui.LIMITS["log_mb"]）
-LOG_KEEP = 3                  # 保留 3 份历史（tray.log.1 ~ .3）
-LOG_RETENTION_DAYS = 14       # 超过 14 天的分片直接删除
+LOG_MAX_MB = float(tray_ui.FORM_DEFAULTS["log_max_mb"])
+LOG_KEEP = int(tray_ui.FORM_DEFAULTS["log_keep"])
+LOG_RETENTION_DAYS = int(tray_ui.FORM_DEFAULTS["log_retention_days"])
 
 # 设备整个消失（拔掉 / 被供电切断）后，圆环继续显示最后读数的时长。
 # 只用来吸收「重新枚举」这类短暂断线，所以默认是分钟级：拔掉的设备
 # 不该在任务栏上留很久。
-STALE_MIN_DEFAULT = 2
+STALE_MIN_DEFAULT = int(tray_ui.FORM_DEFAULTS["stale_min"])
 STALE_MIN_LEGACY_HOURS = 6      # 旧配置是 stale_hours，迁移时按小时换算
 
 _INF = float("inf")
@@ -86,7 +138,7 @@ def _to_float(value):
     """转 float；非法输入、NaN、Inf 一律返回 None。"""
     try:
         val = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     if val != val or val in (_INF, -_INF):
         return None
@@ -188,7 +240,7 @@ def log(msg):
             os.makedirs(LOCALDIR, exist_ok=True)
             if os.path.exists(LOG) and os.path.getsize(LOG) > max_bytes:
                 rotate_log(LOG, keep)
-            with open(LOG, "a", encoding="utf-8") as f:
+            with open(LOG, "a", encoding="utf-8", errors="backslashreplace") as f:
                 f.write(line)
         except OSError:
             pass
@@ -219,21 +271,58 @@ def install_crash_hooks(root=None):
         root.report_callback_exception = tk_hook
 
 
+def _read_json_object(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def migrate_legacy_config():
+    """首次启动时迁移旧版设置，已存在的新版设置优先。"""
+    if os.path.exists(CONFIG):
+        return False
+    old = ((_DEFAULT_APPDIR and _read_json_object(os.path.join(_DEFAULT_APPDIR, "config.json")))
+           or _read_json_object(os.path.join(_PORTABLE_APPDIR, "config.json"))
+           or (LEGACY_CONFIG and _read_json_object(LEGACY_CONFIG)))
+    if not old:
+        return False
+    temp_path = None
+    candidate = f"{CONFIG}.{os.getpid()}.{time.time_ns()}.tmp"
+    try:
+        with open(candidate, "x", encoding="utf-8") as f:
+            temp_path = candidate
+            json.dump(old, f, ensure_ascii=False, indent=2)
+        # Windows 的 rename 不会覆盖首次启动期间新建的配置。
+        os.rename(temp_path, CONFIG)
+        temp_path = None
+        return True
+    except FileExistsError:
+        return False
+    except OSError as exc:
+        log("迁移旧版设置失败: %s" % exc)
+        return False
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
 def load_config():
-    cfg = {"interval_sec": 60, "low_threshold": 20, "taskbar": True,
+    cfg = {"interval_sec": int(tray_ui.FORM_DEFAULTS["interval"]),
+           "low_threshold": tray_ui.DEFAULT_LOW_THRESHOLD, "taskbar": True,
+           "theme": tray_ui.DEFAULT_THEME,
            "device_name": "", "mouse_name": "",
            "show": {"device": True, "mouse": True},
            "stale_min": STALE_MIN_DEFAULT,
            "log_max_mb": LOG_MAX_MB, "log_keep": LOG_KEEP,
            "log_retention_days": LOG_RETENTION_DAYS}
-    raw = {}
-    try:
-        with open(CONFIG, encoding="utf-8") as f:
-            raw = json.load(f)
-    except (OSError, ValueError):
-        raw = {}
-    if not isinstance(raw, dict):
-        raw = {}
+    raw = _read_json_object(CONFIG)
+    defaults = cfg.copy()
     cfg.update(raw)
     if "log_max_mb" not in raw:
         # 旧版本用 KB 记这个值，迁移一次（1 MB = 1024 KB）
@@ -246,8 +335,22 @@ def load_config():
         old_h = _to_float(raw.get("stale_hours"))
         if old_h is not None:
             lo, hi, _ = LIMITS["stale_min"]
-            cfg["stale_min"] = int(max(lo, min(hi, round(old_h * 60))))
+            cfg["stale_min"] = round(max(lo, min(hi, old_h * 60)))
     cfg.pop("stale_hours", None)
+    for setting, limit, _, cast in tray_ui.FORM_FIELDS.values():
+        lo, hi, _ = LIMITS[limit]
+        value = _to_float(cfg[setting])
+        cfg[setting] = defaults[setting] if value is None else cast(max(lo, min(hi, value)))
+    saved_show = cfg["show"]
+    cfg["show"] = dict(defaults["show"])
+    if isinstance(saved_show, dict):
+        cfg["show"].update({key: shown for key, shown in saved_show.items() if isinstance(shown, bool)})
+    if not isinstance(cfg["taskbar"], bool):
+        cfg["taskbar"] = defaults["taskbar"]
+    cfg["theme"] = tray_ui.normalize_theme(cfg["theme"])
+    for key in cfg:
+        if key.endswith("_name") and not isinstance(cfg[key], str):
+            cfg[key] = ""
     return cfg
 
 
@@ -259,11 +362,12 @@ def save_config(changes=None):
                 snapshot.update(changes)
             snapshot["show"] = dict(CFG["show"])
             if changes is not None:
-                snapshot["show"].update(changes["show"])
+                snapshot["show"].update(changes.get("show", {}))
             with open(CONFIG + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
             os.replace(CONFIG + ".tmp", CONFIG)
-        except OSError:
+        except OSError as exc:
+            log(f"保存设置失败: {exc}")
             if changes is not None:
                 raise
         else:
@@ -272,12 +376,7 @@ def save_config(changes=None):
 
 
 def load_last():
-    try:
-        with open(LAST, encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return _read_json_object(LAST)
 
 
 _LAST_SIG = None
@@ -393,6 +492,7 @@ WM_RBUTTONUP = 0x0205
 # WM_USER 以下的系统消息不能 PostMessage（会返回 ERROR_MESSAGE_SYNC_ONLY），
 # 所以退出用一个自定义消息，绝不能直接 Post WM_DESTROY。
 WM_APP_STOP = 0x8000 + 1
+WM_APP_OPEN = 0x8000 + 2
 DBT_DEVTYP_DEVICEINTERFACE = 0x0005
 DEVICE_NOTIFY_ALL_INTERFACE_CLASSES = 0x4
 
@@ -453,11 +553,17 @@ def _ask(inst, req, cmd, attempts=3, wait=0.7):
 
 
 def find_compx(devs=None):
+    fallback = None
     for d in (devs if devs is not None else enum_hid()):
-        if (d["vid"], d["pid"]) == (VID, PID) and d["page"] == 0xFF02 \
-                and d["inl"] == REPORT_LEN and d["outl"] == REPORT_LEN:
+        product = (d["vid"], d["pid"])
+        if (product not in COMPX_RECEIVERS or d["usage"] != 0x02
+                or d["inl"] != REPORT_LEN or d["outl"] != REPORT_LEN):
+            continue
+        if product == (VID, PID) and d["page"] == 0xFF02:
             return d["inst"]
-    return None
+        if fallback is None and d["page"] in (0xFF02, 0xFF04):
+            fallback = d["inst"]
+    return fallback
 
 
 def compx_battery(inst):
@@ -496,8 +602,9 @@ HIDPP_TYPES = {0: "键盘", 1: "遥控器", 2: "数字键盘", 3: "鼠标",
 
 
 def _set_error(dev, msg):
+    msg = msg or "读数不可用"
     if dev.error != msg and not msg.startswith("未发现") and "无应答" not in msg:
-        log("读取%s失败：%s" % ("Compx" if dev is KB else "Logitech", msg))
+        log("读取 %s 失败：%s" % (dev.display_name(), msg))
     dev.error = msg
 
 
@@ -551,7 +658,7 @@ def hidpp_battery(path, dev):
     if idx is None:
         return None, "电量特性查询无应答"
     if idx == 0:
-        return None, "不支持 0x1000 电量特性"
+        return hidpp_unified_battery(path, dev)
     r = hidpp_request(path, dev, idx, 0x00)
     if not r:
         return None, "电量查询无应答"
@@ -559,6 +666,29 @@ def hidpp_battery(path, dev):
         return parse_hidpp_battery(r, dev), None
     except ValueError as e:
         return None, str(e)
+
+
+def hidpp_unified_battery(path, dev):
+    idx = hidpp_feature(path, dev, HIDPP_UNIFIED_BATTERY)
+    if idx is None:
+        return None, "电量特性查询无应答"
+    if idx == 0:
+        return None, "不支持 HID++ 电量特性"
+    key = (path, dev, HIDPP_UNIFIED_BATTERY, "percentage")
+    if key not in _HIDPP_CACHE:
+        caps = hidpp_request(path, dev, idx, 0)
+        if not caps:
+            return None, "电量能力查询无应答"
+        _HIDPP_CACHE[key] = bool(caps[5] & 0x02)
+    if not _HIDPP_CACHE[key]:
+        return None, "设备只上报电量档位"
+    report = hidpp_request(path, dev, idx, 1)
+    if not report:
+        return None, "电量查询无应答"
+    try:
+        return parse_hidpp_unified_battery(report), None
+    except ValueError as exc:
+        return None, str(exc)
 
 
 def logitech_paths(devs):
@@ -570,11 +700,13 @@ def logitech_paths(devs):
 # ---------------------------------------------------------------- 设备模型
 
 class Device:
-    def __init__(self, key, kind, receiver=None, slot=None):
+    def __init__(self, key, kind, receiver=None, slot=None, *, rapoo_report_len=None, vendor_model=None):
         self.key = key
         self.kind = kind
         self.receiver = receiver
         self.slot = slot
+        self.rapoo_report_len = rapoo_report_len
+        self.vendor_model = vendor_model
         self.present = False
         self.disconnected_at = None
         self.next_due = 0.0        # 下次轮询时间戳
@@ -628,6 +760,10 @@ DEVICES = [KB]
 ICON = None
 ROOT = None
 PANELS = []
+_OPEN_REQUEST = threading.Event()
+_STOP_WORKER = threading.Event()
+_WORKER_PROGRESS = 0.0
+_WORKER_STALLED = False
 
 
 def logitech_key(receiver, slot):
@@ -640,6 +776,10 @@ def restore_devices(last, hid_devs):
     inst = find_compx(hid_devs)
     compx = hid_path(inst) if inst else None
     paths = logitech_paths(hid_devs)
+    update_rapoo(hid_devs)
+    update_vendor_devices(hid_devs)
+    vendor_devices = {dev.key: dev for dev in DEVICES
+                      if dev.rapoo_report_len is not None or dev.vendor_model is not None}
     for key, saved in last.items():
         if not isinstance(saved, dict):
             continue
@@ -649,6 +789,10 @@ def restore_devices(last, hid_devs):
                 continue
             dev = KB
             dev.receiver = compx
+        elif key in vendor_devices:
+            dev = vendor_devices[key]
+            if dev.receiver != receiver or not dev.present:
+                continue
         else:
             slot = saved.get("slot")
             if (not isinstance(receiver, str) or receiver not in paths or type(slot) is not int
@@ -661,7 +805,7 @@ def restore_devices(last, hid_devs):
         dev.wired = bool(saved.get("wired"))
         dev.status = saved.get("status") or ""
         dev.updated = saved.get("ts")
-        dev.name = saved.get("name") or ""
+        dev.name = saved.get("name") or dev.name
         dev.model_id = saved.get("model_id")
         dev.error = "等待读取"
         dev.set_present(True)
@@ -798,7 +942,7 @@ def is_autostart():
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
             val, _ = winreg.QueryValueEx(k, APP_NAME)
-            return bool(val)
+            return isinstance(val, str) and val.casefold() == autostart_command().casefold()
     except OSError:
         return False
 
@@ -831,6 +975,13 @@ def taskbar_theme_dark():
             return winreg.QueryValueEx(k, "SystemUsesLightTheme")[0] == 0
     except OSError:
         return True
+
+
+def ui_theme_dark(system_dark=None):
+    theme = CFG.get("theme", tray_ui.DEFAULT_THEME)
+    if theme == "dark" or theme == "light":
+        return theme == "dark"
+    return taskbar_theme_dark() if system_dark is None else system_dark
 
 
 def query_notification_state():
@@ -1029,7 +1180,7 @@ class TaskbarPanel:
         self.label.pack(expand=True)
         self.win.withdraw()
 
-        self.card = tray_ui.TooltipCard(root, self.palette)
+        self.card = tray_ui.TooltipCard(root, tray_ui.Palette(ui_theme_dark(self.dark)))
         self.win.bind("<ButtonRelease-1>", lambda _: self._refresh_from_click(on_refresh))
         self.win.bind("<ButtonRelease-3>", lambda event: self._open_overview(event, on_overview))
         self.label.bind("<Enter>", lambda e: self._schedule_tip())
@@ -1101,10 +1252,14 @@ class TaskbarPanel:
         self.palette = tray_ui.Palette(dark)
         self.win.configure(bg=self.palette.bg)
         self.label.configure(bg=self.palette.bg)
-        self.card.set_palette(self.palette)
         self._last_key = None            # 强制按新配色重画
         self.update(self.dev.display_level, self.dev.charging, self._stale(),
                     disconnected=self._gone())
+
+    def retint_tooltip(self, dark):
+        if self.card.palette.dark != dark:
+            self.card.set_palette(tray_ui.Palette(dark))
+            self.refresh_tip()
 
     # -- 位置 --------------------------------------------------------
 
@@ -1257,7 +1412,7 @@ class TaskbarPanel:
 
     def _refresh_tip(self):
         """按最新读数重绘卡片内容；卡片开着时电量变化也能立刻反映。"""
-        w, h = self.card.show_for(self.dev, self.dev.display_name(), self.palette,
+        w, h = self.card.show_for(self.dev, self.dev.display_name(),
                                   refresh=HOTPLUG.refresh_status(), threshold=CFG["low_threshold"])
         x, y = self._last_rect or (self.win.winfo_rootx(), self.win.winfo_rooty())
         self.card.place(x, y, self.SIZE, w, h)
@@ -1292,12 +1447,14 @@ def _hotplug_wnd_proc(hwnd, msg, wparam, lparam):
 def _ensure_hotplug_class(hinst, class_name):
     global _HOTPLUG_PROC
     if _HOTPLUG_PROC is None:
-        _HOTPLUG_PROC = WNDPROC(_hotplug_wnd_proc)
+        proc = WNDPROC(_hotplug_wnd_proc)
         wc = WNDCLASSW()
-        wc.lpfnWndProc = ctypes.cast(_HOTPLUG_PROC, ctypes.c_void_p)
+        wc.lpfnWndProc = ctypes.cast(proc, ctypes.c_void_p)
         wc.hInstance = hinst
         wc.lpszClassName = class_name
-        u32.RegisterClassW(ctypes.byref(wc))
+        if not u32.RegisterClassW(ctypes.byref(wc)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        _HOTPLUG_PROC = proc
     return _HOTPLUG_PROC
 
 
@@ -1308,7 +1465,7 @@ class HotplugWatcher:
     ui_tick 读取——跨线程碰 Tk 会直接崩。
     """
 
-    CLASS = "KBTrayHotplugWnd"
+    CLASS = "PbtPythonHost"
 
     def __init__(self):
         self._event = threading.Event()
@@ -1328,7 +1485,7 @@ class HotplugWatcher:
         try:
             hinst = k32.GetModuleHandleW(None)
             _ensure_hotplug_class(hinst, self.CLASS)
-            hwnd = u32.CreateWindowExW(0, self.CLASS, "kb-battery-hotplug", 0,
+            hwnd = u32.CreateWindowExW(0, self.CLASS, DISPLAY_NAME, 0,
                                        0, 0, 0, 0, None, None, hinst, None)
             if not hwnd:
                 log("热插拔窗口创建失败 err=%s" % ctypes.get_last_error())
@@ -1338,10 +1495,12 @@ class HotplugWatcher:
             dbi = DEV_BROADCAST_DEVICEINTERFACE()
             dbi.dbcc_size = ctypes.sizeof(dbi)
             dbi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE
-            u32.RegisterDeviceNotificationW(
-                hwnd, ctypes.byref(dbi), DEVICE_NOTIFY_ALL_INTERFACE_CLASSES)
+            if not u32.RegisterDeviceNotificationW(
+                    hwnd, ctypes.byref(dbi), DEVICE_NOTIFY_ALL_INTERFACE_CLASSES):
+                log(f"热插拔通知注册失败，使用定时扫描 err={ctypes.get_last_error()}")
+            else:
+                log("热插拔监听就绪 hwnd=%#x" % hwnd)
             self._ready.set()
-            log("热插拔监听就绪 hwnd=%#x" % hwnd)
             msg = wt.MSG()
             while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 u32.TranslateMessage(ctypes.byref(msg))
@@ -1358,6 +1517,9 @@ class HotplugWatcher:
             self._settings.set()               # 主题/分辨率变了，让 ui_tick 复核
         elif msg == WM_APP_STOP:
             u32.DestroyWindow(hwnd)            # 触发 WM_DESTROY → PostQuitMessage
+            return 0
+        elif msg == WM_APP_OPEN:
+            _OPEN_REQUEST.set()
             return 0
         elif msg == WM_DESTROY:
             self._hwnd = None
@@ -1542,6 +1704,76 @@ def poll_logitech(dev):
     dev.error = ""
 
 
+def update_rapoo(hid_devs):
+    receivers = {}
+    for interface in hid_devs:
+        if interface["vid"] != 0x24AE or interface["pid"] not in RAPOO_VT_RECEIVERS:
+            continue
+        name, lengths = RAPOO_VT_RECEIVERS[interface["pid"]]
+        if (interface["page"], interface["usage"]) != (0xFF00, 0x0002):
+            continue
+        if interface["inl"] not in lengths:
+            continue
+        receivers[hid_path(interface["inst"])] = (name, interface["inl"])
+
+    for dev in DEVICES:
+        if dev.rapoo_report_len is None:
+            continue
+        receiver = receivers.pop(dev.receiver, None)
+        dev.set_present(receiver is not None)
+        if receiver is None:
+            _set_error(dev, "未发现雷柏接收器")
+        else:
+            dev.name, dev.rapoo_report_len = receiver
+
+    for path, (name, length) in receivers.items():
+        digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+        dev = Device("rapoo_" + digest, "鼠标", path, rapoo_report_len=length)
+        dev.name = name
+        dev.set_present(True)
+        DEVICES.append(dev)
+
+
+def poll_rapoo(dev):
+    if not dev.present:
+        return
+    length = dev.rapoo_report_len
+    report = read_input_report(dev.receiver, length,
+                               lambda frame: parse_rapoo_vt_battery(frame, length) is not None,
+                               timeout=5.0)
+    if report is None:
+        _set_error(dev, "电量上报无应答（鼠标休眠/关机？）")
+        return
+    apply_vendor_reading(dev, parse_rapoo_vt_battery(report, length))
+
+
+def update_vendor_devices(hid_devs):
+    candidates = vendor_battery.receivers(hid_devs)
+    for dev in DEVICES:
+        if dev.vendor_model is None:
+            continue
+        model = candidates.pop(dev.receiver, None)
+        dev.set_present(model is not None)
+        if model is None:
+            _set_error(dev, "未发现接收器")
+    for path, model in candidates.items():
+        digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+        dev = Device("vendor_" + digest, "鼠标", path, vendor_model=model)
+        dev.name = model.name
+        dev.set_present(True)
+        DEVICES.append(dev)
+
+
+def apply_vendor_reading(dev, reading):
+    if reading is None:
+        _set_error(dev, "电量查询无应答（设备休眠/关机？）")
+        return
+    dev.level, dev.charging = reading
+    dev.status = "充电中" if dev.charging else "电池供电"
+    dev.updated = time.time()
+    dev.error = ""
+
+
 BACKOFF = (60, 120, 180, 300)     # 连续失败后的间隔：1/2/3/5 分钟
 
 
@@ -1555,6 +1787,11 @@ def next_delay(fails, ok):
 def poll_device(dev, hid_devs):
     if dev is KB:
         poll_keyboard(hid_devs)
+    elif dev.rapoo_report_len is not None:
+        poll_rapoo(dev)
+    elif dev.vendor_model is not None:
+        if dev.present:
+            apply_vendor_reading(dev, vendor_battery.read_battery(dev.receiver, dev.vendor_model))
     else:
         poll_logitech(dev)
     if dev.error:
@@ -1571,6 +1808,8 @@ def poll_all():
     invalidate_devices()
     devs = hid_devices(force=True)
     update_logitech(devs, force=True)
+    update_rapoo(devs)
+    update_vendor_devices(devs)
     for d in DEVICES:
         poll_device(d, devs)
 
@@ -1617,8 +1856,10 @@ def publish_status():
 
 
 def worker():
+    global _WORKER_PROGRESS
     rescan = False
-    while True:
+    while not _STOP_WORKER.is_set():
+        _WORKER_PROGRESS = time.monotonic()
         try:
             if HOTPLUG.take_refresh():
                 try:
@@ -1635,9 +1876,13 @@ def worker():
                 if now >= _LOGITECH_SCAN_DUE or any(now >= d.next_due for d in DEVICES):
                     devs = hid_devices()
                     update_logitech(devs)
+                    update_rapoo(devs)
+                    update_vendor_devices(devs)
                     for dev in DEVICES:
                         if time.time() >= dev.next_due:
+                            _WORKER_PROGRESS = time.monotonic()
                             poll_device(dev, devs)
+            DEVICES[:] = [dev for dev in DEVICES if dev is KB or has_status(dev)]
             publish_status()
         except Exception:
             log("worker 异常: " + traceback.format_exc())
@@ -1647,7 +1892,9 @@ def worker():
         deadlines.extend(expiry for d in DEVICES
                          if (expiry := stale_expiry(d)) is not None and expiry > now)
         nxt = min(deadlines)
-        rescan = HOTPLUG.wait(max(1.0, min(60.0, nxt - now)))
+        _WORKER_PROGRESS = time.monotonic()
+        if not _STOP_WORKER.is_set():
+            rescan = HOTPLUG.wait(max(1.0, min(60.0, nxt - now)))
 
 
 # ---------------------------------------------------------------- 菜单
@@ -1674,9 +1921,15 @@ def overview_rows():
         else:
             time_or_label = tray_ui.TooltipCard._meta(dev) if dev.updated else ""
         detail = " · ".join(filter(None, (reading.status, time_or_label)))
+        historical = reading.historical
+        if _WORKER_STALLED and dev.present:
+            detail = "设备读取超时"
+            if reading.level is not None:
+                detail += " · 上次电量"
+                historical = True
         ring_shown = is_shown(dev) if dev.present and taskbar else None
         rows.append(tray_ui.OverviewRow(dev.key, dev.display_name(), reading.level, detail,
-                                     dev.charging, reading.historical, ring_shown))
+                                     dev.charging, historical, ring_shown))
     return rows
 
 
@@ -1709,7 +1962,7 @@ def open_overview(anchor=None, selected=None):
     anchor = anchor or tray_panel_anchor()
     _, dpi = tray_ui.monitor_at(*tray_ui.anchor_center(anchor))
     dpi = dpi or round(ROOT.winfo_fpixels("1i"))
-    dark = taskbar_theme_dark()
+    dark = ui_theme_dark()
     for panel in PANELS:
         panel._hide_tip()
     if (_OVERVIEW is not None and _OVERVIEW.alive()
@@ -1719,7 +1972,8 @@ def open_overview(anchor=None, selected=None):
         _OVERVIEW = tray_ui.DeviceOverview(
             ROOT, palette=tray_ui.Palette(dark), dpi=dpi, on_refresh=_refresh_from_overview,
             on_settings=open_settings, on_toggle_ring=toggle_device_ring,
-            on_taskbar=on_taskbar, on_autostart=on_autostart, on_log=on_log, on_quit=on_quit)
+            on_taskbar=on_taskbar, on_autostart=on_autostart, on_log=on_log, on_quit=on_quit,
+            on_update=on_update)
     _update_overview_options()
     _OVERVIEW.show(anchor, selected, overview_rows(), HOTPLUG.refresh_status(), CFG["low_threshold"])
 
@@ -1736,6 +1990,7 @@ def current_settings():
     for dev in DEVICES:
         show.setdefault(dev.key, True)
     return {
+        "theme": CFG.get("theme", tray_ui.DEFAULT_THEME),
         "interval_sec": CFG["interval_sec"],
         "low_threshold": CFG["low_threshold"],
         "stale_min": CFG.get("stale_min", STALE_MIN_DEFAULT),
@@ -1754,6 +2009,9 @@ def apply_settings(values, persist=True):
     这里只负责落到 CFG 并触发副作用。
     """
     changes = {"show": {key: bool(value) for key, value in values.get("show", {}).items()}}
+    previous_theme = CFG.get("theme", tray_ui.DEFAULT_THEME)
+    if "theme" in values:
+        changes["theme"] = tray_ui.normalize_theme(values["theme"])
     for setting, limit, _, cast in tray_ui.FORM_FIELDS.values():
         if setting == "stale_min" and setting not in values:
             continue
@@ -1773,6 +2031,8 @@ def apply_settings(values, persist=True):
     for p in PANELS:           # 显示开关即时生效，不等下一次 tick
         if not is_shown(p.dev):
             p.hide()
+    if CFG.get("theme", tray_ui.DEFAULT_THEME) != previous_theme:
+        check_theme()
     if ICON:
         try:
             ICON.title = status_text()
@@ -1819,7 +2079,8 @@ def open_settings(anchor=None):
     _SETTINGS = tray_ui.SettingsDialog(
         ROOT, current_settings(), _device_rows(),
         on_save=_save_from_dialog,
-        palette=tray_ui.Palette(taskbar_theme_dark()), anchor=anchor)
+        palette=tray_ui.Palette(ui_theme_dark()), anchor=anchor,
+        system_theme_dark=taskbar_theme_dark)
     _SETTINGS.show()
     return
 
@@ -1834,8 +2095,11 @@ def on_autostart():
 
 
 def on_taskbar():
-    CFG["taskbar"] = not CFG.get("taskbar", True)
-    save_config()
+    try:
+        save_config({"taskbar": not CFG.get("taskbar", True)})
+    except OSError:
+        tk.messagebox.showerror(DISPLAY_NAME, "无法保存任务栏圆环设置。")
+        return
     if not CFG["taskbar"]:
         for p in PANELS:
             p.hide()
@@ -1847,16 +2111,67 @@ def on_log():
     os.startfile(LOG)
 
 
-def on_quit():
-    log("退出")
-    HOTPLUG.stop()
-    close_all()
-    if ROOT:
+_UPDATE_BUSY = False
+
+
+def on_update():
+    import queue
+    import shutil
+    from pathlib import Path
+    from tkinter import messagebox
+
+    import app_update
+
+    global _UPDATE_BUSY
+    title = "外设电量更新"
+    if _UPDATE_BUSY:
+        messagebox.showinfo(title, "正在检查或下载更新，请稍等。", parent=ROOT)
+        return
+    _UPDATE_BUSY = True
+    installation = Path(__file__).resolve().parent
+    result_queue = queue.SimpleQueue()
+
+    def download():
         try:
-            ROOT.quit()
-        except Exception:
-            pass
-    os._exit(0)
+            release = app_update.latest_release()
+            work = app_update.prepare_update(release, installation) if release else None
+            result_queue.put((release, work, None))
+        except Exception as exc:
+            result_queue.put((None, None, exc))
+
+    def finish():
+        global _UPDATE_BUSY
+        try:
+            release, work, error = result_queue.get_nowait()
+        except queue.Empty:
+            ROOT.after(150, finish)
+            return
+        try:
+            if error:
+                messagebox.showerror(title, f"检查或下载更新失败。\n\n{error}", parent=ROOT)
+            elif release is None:
+                messagebox.showinfo(title, f"当前版本 {app_update.APP_VERSION}，没有可用的正式更新。",
+                                    parent=ROOT)
+            elif messagebox.askyesno(
+                    title, f"{release.tag} 已下载并通过校验。安装后会重启程序。\n\n"
+                    "安装会替换当前程序文件并保留备份，设置和日志会保留。现在安装吗？",
+                    parent=ROOT):
+                app_update.start_install(work, installation, INSTANCE_MUTEX)
+                on_quit()
+            else:
+                shutil.rmtree(work, ignore_errors=True)
+        except OSError as exc:
+            messagebox.showerror(title, f"无法启动更新。\n\n{exc}", parent=ROOT)
+        finally:
+            _UPDATE_BUSY = False
+
+    threading.Thread(target=download, daemon=True).start()
+    ROOT.after(150, finish)
+
+
+def on_quit():
+    if ROOT:
+        ROOT.quit()
 
 
 def toggle_device_ring(key):
@@ -1867,16 +2182,104 @@ def toggle_device_ring(key):
 
 
 class TrayIcon(pystray.Icon):
+    # The pinned Win32 backend creates a setup thread before its windows exist.
+    # Own the thread here so a failed startup cannot strand that setup thread.
+    def start(self):
+        self._closing = threading.Event()
+        self._tray_thread = threading.Thread(target=self._serve, name="tray", daemon=True)
+        self._tray_thread.start()
+
+    def _serve(self):
+        try:
+            super()._run()
+        except Exception:
+            log("托盘初始化失败: " + traceback.format_exc())
+        finally:
+            self._running = False
+
+    def _create_window(self, atom):
+        hwnd = tray_win32.CreateWindowEx(0, atom, None, tray_win32.WS_POPUP,
+            0, 0, 0, 0, 0, None, tray_win32.GetModuleHandle(None), None)
+        try:
+            tray_win32.ChangeWindowMessageFilterEx(
+                hwnd, tray_win32.WM_TASKBARCREATED, tray_win32.MSGFLT_ALLOW, None)
+        except PermissionError:
+            # The optional elevated Explorer notification must not block initial registration.
+            log("无法登记跨权限的任务栏重建通知，继续创建托盘")
+        return hwnd
+
+    def _mark_ready(self):
+        self._running = True
+        if not self._closing.is_set():
+            try:
+                self.visible = True
+                return
+            except OSError as exc:
+                log(f"托盘图标注册失败: {exc}")
+        self._stop()
+
+    def _show(self):
+        self._assert_icon_handle()
+        flags = tray_win32.NIF_MESSAGE | tray_win32.NIF_ICON | tray_win32.NIF_TIP
+        data = tray_win32.NOTIFYICONDATAW(cbSize=ctypes.sizeof(tray_win32.NOTIFYICONDATAW),
+            hWnd=self._hwnd, hID=id(self) & 0xffffffff, uFlags=flags,
+            uCallbackMessage=tray_win32.WM_NOTIFY, hIcon=self._icon_handle, szTip=self.title)
+        if not tray_win32.Shell_NotifyIcon(tray_win32.NIM_ADD, data):
+            raise OSError("Shell_NotifyIconW(NIM_ADD)")
+
+    def available(self):
+        return self._tray_thread.is_alive() and self.visible
+
+    def stop(self):
+        self._closing.set()
+        if self._tray_thread.is_alive() and self._running:
+            self._stop()
+        self._tray_thread.join(timeout=2)
+
     def _on_notify(self, wparam, lparam):
         # Win32 托盘点击交给 Tk 主线程显示共用面板。
         if lparam in (WM_LBUTTONUP, WM_RBUTTONUP, WM_CONTEXTMENU):
-            ROOT.after(0, open_overview)
+            _OPEN_REQUEST.set()
         else:
             super()._on_notify(wparam, lparam)
 
 
 def build_icon():
     return TrayIcon(DISPLAY_NAME, make_image(None), DISPLAY_NAME)
+
+
+def start_tray(attempt=1):
+    global ICON
+    try:
+        installed = package_version("pystray")
+    except PackageNotFoundError:
+        installed = "未知"
+    if tray_win32 is None or installed != "0.19.5":
+        log(f"托盘后端版本 {installed} 未验证，需要 pystray 0.19.5，打开设备概览")
+        _OPEN_REQUEST.set()
+        return
+    try:
+        ICON = build_icon()
+        ICON.start()
+    except Exception:
+        ICON = None
+        log("托盘初始化失败: " + traceback.format_exc())
+
+    def verify():
+        global ICON
+        if ICON is not None and ICON.available():
+            return
+        if ICON is not None:
+            ICON.stop()
+            ICON = None
+        if attempt == 1:
+            log("托盘图标未就绪，重试一次")
+            start_tray(2)
+        else:
+            log("托盘图标不可用，打开设备概览")
+            _OPEN_REQUEST.set()
+
+    ROOT.after(2500, verify)
 
 
 _TICKS = {"n": 0, "ts": 0.0, "visibility": None}
@@ -1888,6 +2291,14 @@ _TOP = {"raise": 0}            # 累计抢回次数，用于心跳日志
 
 def ui_tick():
     try:
+        if _OPEN_REQUEST.is_set():
+            _OPEN_REQUEST.clear()
+            open_overview()
+        current = set(DEVICES)
+        for panel in tuple(PANELS):
+            if panel.dev not in current:
+                panel.destroy()
+                PANELS.remove(panel)
         _update_overview()
         _update_settings()
         anchor = ANCHOR.update()
@@ -1920,7 +2331,7 @@ def ui_tick():
                     PANELS.append(TaskbarPanel(ROOT, dev, len(PANELS), on_refresh, open_overview))
             for p in PANELS:
                 if p.dev in visible:
-                    p.update(p.dev.display_level, p.dev.charging, bool(p.dev.error),
+                    p.update(p.dev.display_level, p.dev.charging, bool(p.dev.error) or _WORKER_STALLED,
                              disconnected=not p.dev.present)
                     p.place(anchor, visible.index(p.dev))
                     p.refresh_tip()      # 卡片开着时跟着读数走
@@ -1948,17 +2359,14 @@ def ui_tick():
 
 
 def check_theme():
-    """系统切换深/浅色后，面板底色和卡片配色跟着变，不用重启。
-
-    只做「值变了才重画」：广播会在拖动主题色板时连续到达，每次都重画
-    会产生一堆无意义的图像分配。
-    """
-    dark = taskbar_theme_dark()
-    if all(p.dark == dark for p in PANELS):
-        return
-    log("系统主题切换 -> %s" % ("深色" if dark else "浅色"))
-    for q in PANELS:
-        q.retint(dark)
+    """刷新任务栏圆环与悬停卡片各自的配色。"""
+    taskbar_dark = taskbar_theme_dark()
+    popup_dark = ui_theme_dark(taskbar_dark)
+    if any(panel.dark != taskbar_dark for panel in PANELS):
+        log("系统主题切换 -> %s" % ("深色" if taskbar_dark else "浅色"))
+    for panel in PANELS:
+        panel.retint(taskbar_dark)
+        panel.retint_tooltip(popup_dark)
 
 
 def topmost_tick():
@@ -1984,14 +2392,21 @@ def topmost_tick():
 
 def pulse_tick():
     """低电量脉冲；顺带当界面循环的看门狗。"""
+    global _WORKER_STALLED
     try:
+        stalled = bool(_WORKER_PROGRESS and time.monotonic() - _WORKER_PROGRESS > 75)
+        if stalled != _WORKER_STALLED:
+            _WORKER_STALLED = stalled
+            log("设备读取超时，保留上次读数" if stalled else "设备读取已恢复")
+            if stalled:
+                HOTPLUG.finish_refresh(ok=False)
         # 看门狗：ui_tick 若是被异常打断而没能重新排程，界面会静默停在最后一帧
         # （圆环位置不再更新、锚点变了也不跟）。这里发现超时就重新拉起。
         if _TICKS["ts"] and time.time() - _TICKS["ts"] > _UI_STALL_SEC:
             log("界面循环停滞 %.1fs，重新拉起" % (time.time() - _TICKS["ts"]))
             _TICKS["ts"] = time.time()
             ROOT.after(0, ui_tick)
-        threshold = CFG.get("low_threshold", 20)
+        threshold = CFG.get("low_threshold", tray_ui.DEFAULT_LOW_THRESHOLD)
         period = tray_ui.PULSE_PERIOD / 1000.0
         phase = (time.time() % period) / period
         active = False
@@ -2009,10 +2424,35 @@ def pulse_tick():
 
 
 def main():
-    mutex = k32.CreateMutexW(None, False, "Local\\" + APP_NAME)
-    if ctypes.get_last_error() == 183:
-        log("已有实例在运行，退出")
-        return 0
+    after_update = "--after-update" in sys.argv
+    deadline = time.monotonic() + (45 if after_update else 0)
+    while True:
+        mutex = k32.CreateMutexW(None, False, INSTANCE_MUTEX)
+        if not mutex:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() != 183:
+            break
+        k32.CloseHandle(mutex)
+        if time.monotonic() >= deadline:
+            if not after_update:
+                for cls, message in ((HotplugWatcher.CLASS, WM_APP_OPEN), ("PbtNativeHost", 0x8000 + 4)):
+                    if (hwnd := u32.FindWindowW(cls, DISPLAY_NAME)) and u32.PostMessageW(hwnd, message, 0, 0):
+                        return 0
+            else:
+                u32.MessageBoxW(None, "更新已完成，请退出正在运行的外设电量后重新启动。", DISPLAY_NAME, 0x30)
+            log("已有实例在运行，退出")
+            return 0
+        time.sleep(0.1)
+    try:
+        return run_app()
+    finally:
+        k32.CloseHandle(mutex)
+
+
+def run_app():
+    if migrate_legacy_config():
+        CFG.update(load_config())
+        log("已迁移旧版设置")
     removed = prune_logs()
     size, keep, days = log_limits()
     log("启动，间隔 %ss，阈值 %s%%，任务栏=%s，日志=%sMB(%dKB)×%d份/%d天%s" % (
@@ -2030,17 +2470,42 @@ def main():
     dpi = tray_ui.apply_dpi_scaling(ROOT)      # 高分屏下让 Tk 控件不再偏小
     log("界面 DPI=%s 缩放=%.2f 圆环=%dpx"
         % (dpi, dpi / 72.0, tray_ui.RING_SIZE))
-    ICON = build_icon()
-    ICON.run_detached()
-    HOTPLUG.start()
-    threading.Thread(target=worker, daemon=True).start()
-    _TICKS["ts"] = time.time()
-    ROOT.after(300, ui_tick)
-    ROOT.after(400, pulse_tick)
-    ROOT.after(500, topmost_tick)
+    class HidLogHandler(logging.Handler):
+        def emit(self, record):
+            log(self.format(record))
+
+    hid_logger = logging.getLogger("hid_transport")
+    hid_log_handler = HidLogHandler()
+    hid_logger.addHandler(hid_log_handler)
+    _STOP_WORKER.clear()
+    poller = threading.Thread(target=worker, name="battery-poll", daemon=True)
+
+    def prune_daily():
+        prune_logs()
+        ROOT.after(24 * 60 * 60 * 1000, prune_daily)
+
     try:
+        start_tray()
+        HOTPLUG.start()
+        poller.start()
+        _TICKS["ts"] = time.time()
+        ROOT.after(300, ui_tick)
+        ROOT.after(400, pulse_tick)
+        ROOT.after(500, topmost_tick)
+        ROOT.after(24 * 60 * 60 * 1000, prune_daily)
         ROOT.mainloop()
     finally:
+        _STOP_WORKER.set()
+        HOTPLUG.wake()
+        HOTPLUG.stop()
+        if ICON is not None:
+            ICON.stop()
+        if poller.ident is not None:
+            poller.join(timeout=0.5)
+        if not poller.is_alive():
+            close_all()
+        hid_logger.removeHandler(hid_log_handler)
+        ROOT.destroy()
         log("主循环结束")
     return 0
 

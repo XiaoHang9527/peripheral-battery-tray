@@ -1,6 +1,7 @@
 import importlib.util
 import pathlib
 import sys
+import threading
 
 import pytest
 
@@ -18,10 +19,32 @@ from unittest.mock import Mock
 def test_tray_click_opens_overview_on_tk_thread(monkeypatch, message):
     root = Mock()
     monkeypatch.setattr(kb, "ROOT", root)
+    opened = threading.Event()
+    monkeypatch.setattr(kb, "_OPEN_REQUEST", opened)
+    show = Mock()
+    monkeypatch.setattr(kb, "open_overview", show)
+    monkeypatch.setattr(kb.ANCHOR, "update", lambda: None)
     icon = kb.build_icon()
     assert icon.name == "外设电量"
-    icon._on_notify(0, message)
-    root.after.assert_called_once_with(0, kb.open_overview)
+    thread = threading.Thread(target=icon._on_notify, args=(0, message))
+    thread.start()
+    thread.join()
+    root.after.assert_not_called()
+    show.assert_not_called()
+    kb.ui_tick()
+    show.assert_called_once_with()
+    assert not opened.is_set()
+
+
+def test_unknown_tray_backend_opens_overview_instead(monkeypatch):
+    opened = threading.Event()
+    build = Mock()
+    monkeypatch.setattr(kb, "_OPEN_REQUEST", opened)
+    monkeypatch.setattr(kb, "package_version", lambda _: "0.20.0")
+    monkeypatch.setattr(kb, "build_icon", build)
+    kb.start_tray()
+    assert opened.is_set()
+    build.assert_not_called()
 
 
 def test_overview_actions_and_refresh_state():
@@ -55,5 +78,21 @@ def test_overview_actions_and_refresh_state():
         assert overview.reload.cget("state") == "normal"
         assert overview.notice.winfo_ismapped()
         assert overview._row_action is None
+
+        _, top, right, bottom = overview._area
+        for y in (top, bottom - 20):
+            overview.show((right - 100, y, right - 80, y + 20), None, rows, "", 20)
+            root.update_idletasks()
+            position = (overview.more.winfo_rootx(), overview.more.winfo_rooty())
+            overview.more.invoke()
+            root.update_idletasks()
+            assert overview._options.winfo_ismapped()
+            assert overview.more.cget("text") == "收起操作"
+            assert (overview.more.winfo_rootx(), overview.more.winfo_rooty()) == position
+            overview.more.invoke()
+            root.update_idletasks()
+            assert not overview._options.winfo_ismapped()
+            assert overview.more.cget("text") == "更多操作"
+            assert (overview.more.winfo_rootx(), overview.more.winfo_rooty()) == position
     finally:
         root.destroy()

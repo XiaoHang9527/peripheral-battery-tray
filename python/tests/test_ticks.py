@@ -69,11 +69,15 @@ def test_ui_tick_survives_exception_in_finally(env, monkeypatch):
 
 def test_ui_tick_skips_placement_without_anchor(env, monkeypatch):
     monkeypatch.setattr(kb.ANCHOR, "update", lambda: None)
-    placed = []
-    monkeypatch.setattr(kb, "TaskbarPanel", kb.TaskbarPanel)
+    mouse = kb.Device("test-mouse", "鼠标")
+    mouse.present, mouse.level = True, 30
+    monkeypatch.setattr(kb, "DEVICES", [mouse])
+    monkeypatch.setattr(kb, "foreground_fullscreen", lambda: False)
+    created = []
+    monkeypatch.setattr(kb, "TaskbarPanel", lambda *args: created.append(args))
     kb.ui_tick()                     # 只要求不炸、仍排程
     assert env.calls and env.calls[-1][1] is kb.ui_tick
-    assert placed == []
+    assert created == []
 
 
 def test_ui_tick_creates_one_panel_per_discovered_device(env, monkeypatch):

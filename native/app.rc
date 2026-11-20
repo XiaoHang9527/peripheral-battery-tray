@@ -1,0 +1,26 @@
+1 24 "app.manifest"
+1 ICON "app.ico"
+
+1 VERSIONINFO
+FILEVERSION @FILE_VERSION@
+PRODUCTVERSION @FILE_VERSION@
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "Peripheral Battery Tray"
+            VALUE "FileVersion", "@VERSION@"
+            VALUE "InternalName", "peripheral-battery-tray-native"
+            VALUE "OriginalFilename", "peripheral-battery-tray-native.exe"
+            VALUE "ProductName", "Peripheral Battery Tray"
+            VALUE "ProductVersion", "@VERSION@"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
