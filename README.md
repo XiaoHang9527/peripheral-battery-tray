@@ -8,6 +8,20 @@
 
 支持 Windows 10 / 11 x64。下载后直接运行，在通知区域打开概览或设置。左键点击任务栏电量圆环可立即刷新，右键打开概览。
 
+## 支持的设备
+
+| 品牌 | 型号 | 连接方式与条件 |
+| --- | --- | --- |
+| AULA 狼蛛 | F75、F99 | 使用 `3554:FA09` 或 `3554:FB40` 的 Compx 2.4 GHz USB 接收器，需上报电量。 |
+| Logitech 罗技 | MX Vertical。其他型号按 HID++ 协议识别。 | 通过兼容的 USB 接收器连接，设备需通过 HID++ 2.0 上报精确百分比。 |
+| Rapoo 雷柏 | VT3 Pro、VT1 Pro Max、VT0、VT9（第二代）、VT3 Max（第二代） | 2.4 GHz USB 接收器，需匹配对应版本的 [接收器 ID 和报文长度](native/README.md#雷柏接收器匹配)。 |
+| Razer 雷蛇 | Viper Ultimate、Mamba Wireless、Basilisk Ultimate、Viper V2 Pro、DeathAdder V3 Pro | 使用对应型号的 2.4 GHz USB 接收器。 |
+| Glorious | Model O Wireless、Model D Wireless、Model O- Wireless、Model D- Wireless | 使用对应型号的 2.4 GHz USB 接收器。 |
+| WLMouse | YING Magnesium | 使用 `36A7:A874` 的 8K USB 接收器。 |
+| 小米 | Mi Air 2S 等兼容的经典蓝牙耳机 | 原生版显示 Windows 上报的耳机整体电量。 |
+
+部分狼蛛 F87 Pro 使用相同的 Compx 协议，兼容性取决于接收器 ID 和电量报文。雷柏 M350（`24AE:187B`）的电量读取尚待验证。
+
 ## 源码与文档
 
 - [原生版源码、设备支持与构建说明](native/)是项目的主要下载和开发版本。

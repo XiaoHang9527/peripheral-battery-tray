@@ -7,8 +7,8 @@ Windows 托盘小工具：在任务栏通知区域左侧按设备显示电量圆
 支持以下 2.4G 接收器和电量协议：
 
 - Compx（`3554:FA09` / `3554:FB40`）——读取采用相同电量报文的键盘，包含 AULA F75、F99 及使用该协议的 F87 Pro 版本。当前选择一个兼容键盘接收器。
-- Logitech HID++ 2.0——支持 `0x1000` 和提供精确百分比的 `0x1004`，按接收器和配对槽位显示电量与名称。Bolt、Lightspeed 的兼容性取决于接收器和配对设备是否提供上述接口。
-- Rapoo VT——被动读取 VT3 Pro、VT1 Pro Max、VT0、VT9（第二代）和 VT3 Max（第二代）匹配接收器的电量上报。M350 的 `24AE:187B` 接收器尚无已验证的电量读取方式。
+- Logitech 罗技——MX Vertical 等使用兼容 USB 接收器的设备，通过 HID++ 2.0 的 `0x1000` 或 `0x1004` 上报精确电量百分比。Bolt、Lightspeed 的兼容性取决于接收器和配对设备提供的接口。
+- Rapoo VT——被动读取 VT3 Pro、VT1 Pro Max、VT0、VT9（第二代）和 VT3 Max（第二代）匹配接收器的电量上报。见 [两版的雷柏接收器匹配表](../native/README.md#雷柏接收器匹配)。
 - Razer——Viper Ultimate、Mamba Wireless、Basilisk Ultimate、Viper V2 Pro、DeathAdder V3 Pro 的指定无线接收器。
 - Glorious——Model O / D / O- / D- Wireless。
 - WLMouse——YING Magnesium 的 8K 接收器（`36A7:A874`）。

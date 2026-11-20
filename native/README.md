@@ -9,8 +9,7 @@ Windows 10 / 11 x64。从仓库根目录运行 `native/dist/peripheral-battery-t
 
 ## 功能
 
-- Compx（如 AULA F75、F99）、支持精确百分比的 Logitech HID++、Rapoo VT、指定 Razer、Glorious 和 WLMouse 接收器。接收器匹配范围与 [Python 版设备列表](../python/README.md#外设电量-python-版)一致。
-- 已连接的经典蓝牙耳机（如 Mi Air 2s）可显示 Windows 上报的整体电量。Windows 暂无读数时显示上次读数或未知。
+- 支持指定的 2.4 GHz 接收器和能向 Windows 上报电量的经典蓝牙耳机。见 [支持的品牌、型号和连接方式](../README.md#支持的设备)。
 - Logitech HID++ 会读取设备型号或类型，并复核首次电量。Rapoo 充电时如果接收器只上报充电状态，电量会显示为未知。
 - 托盘状态、独立任务栏圆环、设备重命名、热插拔识别、低电量提醒和开机自启。
 - 在托盘图标的右键菜单或「概览 → 更多操作」中开关「任务栏圆环」。「设置」中可以为所选设备恢复圆环。找不到托盘图标时，再次双击 EXE 可打开概览。
@@ -23,7 +22,17 @@ Windows 10 / 11 x64。从仓库根目录运行 `native/dist/peripheral-battery-t
 - 设置和运行日志默认放在 `%LOCALAPPDATA%\PeripheralBatteryTrayNative`。该目录不可写时，使用程序旁的 `.data/native`。在程序旁建立空文件 `portable.mode` 可主动使用随身设置。
 - 「更多操作 → 检查更新」查询该仓库的原生版发布。用户确认后才下载，程序验证文件大小和 GitHub 提供的 SHA-256，再退出、替换并重新启动。成功更新后，程序目录中的 `.pbt-native-previous.exe.bak` 保存上一个版本。
 
-Rapoo M350（`24AE:187B`）尚无已验证的电量读取方式。已收录的协议依赖实际接收器所提供的 HID 报告。
+## 雷柏接收器匹配
+
+部分型号在两版中匹配不同的 USB 接收器。下表中的长度指接收器的 HID 输入报文长度，单位为字节。
+
+| 型号 | 原生版 USB ID / 长度 | Python 版 USB ID / 长度 |
+| --- | --- | --- |
+| VT3 Pro | `24AE:1215` / 7 | `24AE:1215` / 7 |
+| VT1 Pro Max | `24AE:1233` / 7 | `24AE:1233` / 7 |
+| VT0 | `24AE:1218` / 13、16 或 19 | `24AE:1410` / 13、16 或 19 |
+| VT9（第二代） | `24AE:1243` / 16 | `24AE:1414` / 13、16 或 19 |
+| VT3 Max（第二代） | `24AE:124D` / 16 | `24AE:1417` / 13、16 或 19 |
 
 ## 构建和测试
 
