@@ -30,6 +30,7 @@ constexpr auto hostClass = L"PbtNativeHost";
 constexpr auto panelClass = L"PbtNativePanel";
 constexpr auto ringClass = L"PbtNativeRing";
 constexpr auto hoverClass = L"PbtNativeHover";
+constexpr auto repositoryUrl = L"https://github.com/XiaoHang9527/peripheral-battery-tray";
 constexpr UINT trayMessage = WM_APP + 1;
 constexpr UINT sampleMessage = WM_APP + 2;
 constexpr UINT updateMessage = WM_APP + 3;
@@ -69,7 +70,7 @@ enum Control : int {
     overviewTab = 100, settingsTab, list, renameEdit, rename, toggleRing, refresh, more, startup,
     update, logs, quit, systemTheme, lightTheme, darkTheme, interval, threshold, retention,
     globalRing, save, cancel, installUpdate, quickRing, resetDefaults, advancedLogs,
-    logSize, logCopies, logDays, settingsScroll
+    logSize, logCopies, logDays, settingsScroll, openRepository
 };
 
 struct NumberField { int id, low, high, y; const wchar_t* label; const wchar_t* unit; int Options::*value; };
@@ -1314,6 +1315,7 @@ void App::createControls() {
     button(quickRing, L"任务栏圆环");
     button(startup, L"开机自启");
     button(logs, L"打开日志");
+    button(openRepository, L"GitHub 仓库");
     button(update, L"检查更新");
     button(settingsTab, L"设置…");
     button(quit, L"退出程序");
@@ -1417,8 +1419,9 @@ void App::placeControls(bool batchPositions) {
     const int optionsTop = overviewListTop + overviewDeviceHeight();
     place(quickRing, 16, optionsTop + 7, 164, 32, !settings_ && expanded_);
     place(startup, 188, optionsTop + 7, 164, 32, !settings_ && expanded_);
-    place(logs, 16, optionsTop + 44, 94, 26, !settings_ && expanded_);
-    place(update, 256, optionsTop + 44, 96, 26, !settings_ && expanded_);
+    place(logs, 16, optionsTop + 44, 104, 26, !settings_ && expanded_);
+    place(openRepository, 132, optionsTop + 44, 104, 26, !settings_ && expanded_);
+    place(update, 248, optionsTop + 44, 104, 26, !settings_ && expanded_);
     place(installUpdate, 265, footer - 34, 87, 25, !settings_ && !available_.downloadPath.empty() && !downloading_);
 
     form(systemTheme, 16, 82, 108, 43);
@@ -1515,7 +1518,8 @@ void App::showOptions(bool show) {
     if (settings_ || expanded_ == show) return;
     if (!show) {
         const auto focus = GetFocus();
-        if (focus == controls_[quickRing] || focus == controls_[startup] || focus == controls_[logs] || focus == controls_[update]) {
+        if (focus == controls_[quickRing] || focus == controls_[startup] || focus == controls_[logs]
+            || focus == controls_[openRepository] || focus == controls_[update]) {
             SetFocus(controls_[more]);
         }
     }
@@ -1830,6 +1834,13 @@ void App::command(int id, int code) {
     case logs:
         if (!directory_.empty()) ShellExecuteW(panel_, L"open", (directory_ / L"tray.log").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         break;
+    case openRepository: {
+        constexpr auto error = L"无法打开 GitHub 仓库，请检查默认浏览器";
+        const auto result = ShellExecuteW(panel_, L"open", repositoryUrl, nullptr, nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) <= 32) status_ = error;
+        else if (status_ == error) status_.clear();
+        break;
+    }
     case update: updateCheck(); return;
     case installUpdate: downloadUpdate(); return;
     case quit: PostMessageW(host_, WM_CLOSE, 0, 0); return;

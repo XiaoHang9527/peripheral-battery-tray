@@ -20,6 +20,7 @@ Windows 10 / 11 x64。从仓库根目录运行 `native/dist/peripheral-battery-t
 - 「设置 → 高级日志设置」可调整单份日志大小、历史日志份数及保留天数。默认每份 512 KB，保留一份历史日志。
 - 可即时预览跟随 Windows、浅色和深色外观。点击「保存」后生效。
 - 设置和运行日志默认放在 `%LOCALAPPDATA%\PeripheralBatteryTrayNative`。该目录不可写时，使用程序旁的 `.data/native`。在程序旁建立空文件 `portable.mode` 可主动使用随身设置。
+- 「概览 → 更多操作 → GitHub 仓库」使用 Windows 默认浏览器打开项目主页。
 - 「更多操作 → 检查更新」查询该仓库的原生版发布。用户确认后才下载，程序验证文件大小和 GitHub 提供的 SHA-256，再退出、替换并重新启动。成功更新后，程序目录中的 `.pbt-native-previous.exe.bak` 保存上一个版本。
 
 ## 雷柏接收器匹配
