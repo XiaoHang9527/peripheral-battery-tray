@@ -16,13 +16,13 @@
 
 一眼查看各设备的电量、连接状态和读数时间。展开「更多操作」可以开关任务栏圆环和开机自启，也可以检查更新。
 
-![浅色模式的设备概览，展示无线键鼠和蓝牙耳机的电量及快捷操作](native/screenshots/overview.jpg)
+![浅色模式的设备概览，展示无线键鼠和蓝牙耳机的电量及快捷操作](windows-native/screenshots/overview.jpg)
 
 ### 设置
 
 可选择跟随 Windows、浅色或深色主题，为单个设备开关任务栏圆环，并调整刷新间隔和低电量阈值。
 
-![深色模式的设置面板，展示外观、设备圆环、刷新间隔和低电量阈值](native/screenshots/settings.jpg)
+![深色模式的设置面板，展示外观、设备圆环、刷新间隔和低电量阈值](windows-native/screenshots/settings.jpg)
 
 ## 支持的设备
 
@@ -30,7 +30,7 @@
 | --- | --- | --- |
 | AULA 狼蛛 | F75、F99 | 使用 `3554:FA09` 或 `3554:FB40` 的 Compx 2.4 GHz USB 接收器，需上报电量。 |
 | Logitech 罗技 | MX Vertical。其他型号按 HID++ 协议识别。 | 通过兼容的 USB 接收器连接，设备需通过 HID++ 2.0 上报精确百分比。 |
-| Rapoo 雷柏 | VT3 Pro、VT1 Pro Max、VT0、VT9（第二代）、VT3 Max（第二代） | 2.4 GHz USB 接收器，需匹配对应版本的 [接收器 ID 和报文长度](native/README.md#雷柏接收器匹配)。 |
+| Rapoo 雷柏 | VT3 Pro、VT1 Pro Max、VT0、VT9（第二代）、VT3 Max（第二代） | 2.4 GHz USB 接收器，需匹配对应版本的 [接收器 ID 和报文长度](windows-native/README.md#雷柏接收器匹配)。 |
 | Razer 雷蛇 | Viper Ultimate、Mamba Wireless、Basilisk Ultimate、Viper V2 Pro、DeathAdder V3 Pro | 使用对应型号的 2.4 GHz USB 接收器。 |
 | Glorious | Model O Wireless、Model D Wireless、Model O- Wireless、Model D- Wireless | 使用对应型号的 2.4 GHz USB 接收器。 |
 | WLMouse | YING Magnesium | 使用 `36A7:A874` 的 8K USB 接收器。 |
@@ -40,6 +40,6 @@
 
 ## 源码与文档
 
-- [原生版源码、设备支持与构建说明](native/)是项目的主要下载和开发版本。
+- [Windows 原生版源码、设备支持与构建说明](windows-native/)在 `windows-native/`。
 - [Python 版源码、运行与维护说明](python/)独立保存在 `python/`，可按目录内的说明运行。
 - [项目状态](项目状态.md)记录两版的功能和本地目录。切换版本前，请先从托盘退出当前程序。

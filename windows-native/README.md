@@ -1,6 +1,6 @@
 # 外设电量原生版
 
-Windows 10 / 11 x64。从仓库根目录运行 `native/dist/peripheral-battery-tray-native.exe`，再从系统托盘打开「概览」或「设置」。
+Windows 10 / 11 x64。构建后，从仓库根目录运行 `windows-native/dist/peripheral-battery-tray-native.exe`，再从系统托盘打开「概览」或「设置」。
 可将可执行文件放在要长期使用的目录，再开启「开机自启」。Python 版和原生版共用互斥锁，
 切换版本时先从托盘退出正在运行的版本，避免两版同时读取接收器。
 
@@ -41,10 +41,10 @@ Windows 10 / 11 x64。从仓库根目录运行 `native/dist/peripheral-battery-t
 在仓库根目录用 PowerShell 构建并运行协议测试：
 
 ```powershell
-.\native\build.ps1 -Compiler 'C:\path\to\x86_64-w64-mingw32-clang++.exe' -Test
+.\windows-native\build.ps1 -Compiler 'C:\path\to\x86_64-w64-mingw32-clang++.exe' -Test
 ```
 
-构建结果位于 `native/dist/peripheral-battery-tray-native.exe`。
+构建结果位于 `windows-native/dist/peripheral-battery-tray-native.exe`。
 不启动托盘的实机检查可用 `peripheral-battery-tray-native.exe --probe probe.tsv`。
 检查会查询接收器，需先退出正在运行的外设电量实例。
 
